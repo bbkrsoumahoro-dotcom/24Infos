@@ -1,1248 +1,1116 @@
-# 24Infos
-#!/usr/bin/env python3
-"""NEXUS DIAMOND v5 — Fonctionnel immédiat. Tout modifiable depuis l'interface."""
-
-import os, sys, json, time, hashlib, re, html, threading, queue, sqlite3
-from datetime import datetime, timezone, timedelta
-from collections import Counter
-from urllib.parse import urlparse
-
-# Auto-install
-for pkg, imp in [("flask","flask"),("feedparser","feedparser"),("bs4","bs4"),("requests","requests")]:
-    try:
-        __import__(imp)
-    except:
-        os.system(f"{sys.executable} -m pip install {pkg} --quiet")
-        __import__(imp)
-
-from flask import Flask, Response, request, jsonify, render_template_string
-import feedparser
-from bs4 import BeautifulSoup
-import requests
-
-# DB
-conn = sqlite3.connect("nexus.db", check_same_thread=False)
-conn.row_factory = sqlite3.Row
-conn.execute("PRAGMA journal_mode=WAL")
-conn.executescript("""
-CREATE TABLE IF NOT EXISTS articles(id TEXT PRIMARY KEY, title TEXT, url TEXT, descr TEXT, source TEXT, slevel INT DEFAULT 70, region TEXT DEFAULT 'inter', level TEXT DEFAULT 'info', score INT DEFAULT 0, cat TEXT DEFAULT 'General', pub TEXT, col TEXT DEFAULT (datetime('now')), img TEXT, lu INT DEFAULT 0);
-CREATE TABLE IF NOT EXISTS alertes(id TEXT PRIMARY KEY, title TEXT, descr TEXT, niveau TEXT DEFAULT 'haute', score INT DEFAULT 0, cat TEXT DEFAULT 'General', sources TEXT, scount INT DEFAULT 1, url TEXT, created TEXT DEFAULT (datetime('now')), lu INT DEFAULT 0);
-CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, val TEXT);
-CREATE TABLE IF NOT EXISTS custom_sources(name TEXT, url TEXT, region TEXT, level INT);
-CREATE TABLE IF NOT EXISTS stats(id INTEGER PRIMARY KEY AUTOINCREMENT, total INT, crit INT, haut INT, moy INT, src INT, alrt INT, ts TEXT DEFAULT (datetime('now')));
-INSERT OR IGNORE INTO settings VALUES('theme','dark'),('interval','180'),('hours','24'),('max_articles','50000'),('extract_images','1');
-""")
-conn.commit()
-
-KW_CRIT = ["meurtre","assassinat","massacre","attentat","explosion","attaque","fusillade","coup d'etat","putsch","insurrection","guerre","conflit arme","terrorisme","epidemie","pandemie","ebola","inondation","seisme","accident mortel","naufrage","crash","incendie","drogue","cocaine","arme de guerre","enlevement","viol","execution","etat d'urgence","couvre-feu","cyberattaque","brèche","anonymous","hacktivisme"]
-KW_HAUT = ["securite","armee","police","gendarmerie","presidence","president","ministre","gouvernement","corruption","detournement","scandale","cybercriminalite","piratage","election","vote","crise politique","diplomatie","defense","renseignement","manifestation","greve","sanction","embargo","droits humains","anonymous","data leak","fuite","ddos","ransomware","hack"]
-KW_MOY = ["sante","hopital","education","ecole","universite","economie","investissement","agriculture","culture","sport","technologie","environnement","nomination","reforme","loi","decret","accident","religion"]
-ALL_KW = list(set(KW_CRIT + KW_HAUT + KW_MOY))
-
-RSS = [
-    ("Fraternité Matin","https://www.fratmat.info/rss","nat",100),("RTI","https://www.rti.ci/rss","nat",100),("Abidjan.net","https://news.abidjan.net/rss","nat",100),("AIP","https://www.aip.ci/feed/","nat",100),("7Info","https://7info.ci/rss","nat",95),("Soir Info","https://www.soirinfo.com/rss","nat",95),("L'Inter","https://www.linterci.com/rss","nat",95),("Koaci","https://www.koaci.com/rss","nat",95),("Linfodrome","https://www.linfodrome.com/24h?format=feed","nat",95),("Connection Ivoirienne","https://www.connectionivoirienne.net/feed/","nat",90),("Jeune Afrique","https://www.jeuneafrique.com/feed/","cont",100),("RFI Afrique","https://www.rfi.fr/fr/afrique/rss","cont",100),("BBC Afrique","https://www.bbc.com/afrique/rss.xml","cont",100),("Le Monde Afrique","https://www.lemonde.fr/afrique/rss_full.xml","cont",100),("AfricaNews","https://www.africanews.com/feed/","cont",95),("France24 Afrique","https://www.france24.com/fr/afrique/rss","cont",95),("Al Jazeera","https://www.aljazeera.com/xml/rss/all.xml","cont",95),("Crisis Group","https://www.crisisgroup.org/rss.xml","inter",95),("HRW","https://www.hrw.org/rss/africa","cont",95),("ISS Africa","https://issafrica.org/rss.xml","cont",95),("ONU Info","https://news.un.org/feed/subscribe/en/news/region/africa/feed/rss.xml","cont",100),("Interpol","https://www.interpol.int/rss","inter",100),("Krebs","https://krebsonsecurity.com/feed/","inter",90),("The Hacker News","https://feeds.feedburner.com/TheHackersNews","inter",85),("Bleeping Computer","https://www.bleepingcomputer.com/feed/","inter",85),("Cisco Talos","https://blog.talosintelligence.com/feed/","inter",90),("CrowdStrike","https://www.crowdstrike.com/blog/feed/","inter",85),("Anonymous News","https://www.anonymous.news/feed/","inter",80),("HackRead","https://www.hackread.com/feed/","inter",80),("Security Affairs","https://securityaffairs.com/feed","inter",80),("Schneier","https://www.schneier.com/feed/","inter",85),("Troy Hunt","https://www.troyhunt.com/rss/","inter",85),("AnonHQ","https://anonhq.com/feed/","inter",75),("GNews CI","https://news.google.com/rss/search?q=C%C3%B4te+d%27Ivoire+apr%C3%A8s+2025&hl=fr&gl=CI&ceid=CI:fr","nat",95),("GNews Securite","https://news.google.com/rss/search?q=s%C3%A9curit%C3%A9+attaque+C%C3%B4te+d%27Ivoire&hl=fr&gl=CI&ceid=CI:fr","nat",95),("GNews Cyber","https://news.google.com/rss/search?q=cybercriminalit%C3%A9+Afrique+hacking&hl=fr&gl=CI&ceid=CI:fr","cont",90),("GNews Terrorisme","https://news.google.com/rss/search?q=terrorisme+Sahel+Afrique+attentat&hl=fr&gl=CI&ceid=CI:fr","cont",95),("GNews Conflits","https://news.google.com/rss/search?q=conflit+guerre+Afrique+monde&hl=fr&gl=CI&ceid=CI:fr","inter",90),
-]
-
-session = requests.Session()
-session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-sse_queue = queue.Queue()
-
-def nml(t):
-    if not t: return ""
-    t = t.lower()
-    for a,b in [('é','e'),('è','e'),('ê','e'),('ë','e'),('à','a'),('â','a'),('ä','a'),('ù','u'),('û','u'),('ü','u'),('ô','o'),('ö','o'),('î','i'),('ï','i'),('ç','c')]:
-        t = t.replace(a,b)
-    return t
-
-def detect_lv(t,d=""):
-    txt = nml(f"{t} {d[:200]}")
-    for k in KW_CRIT:
-        if k in txt: return "critique", [k]
-    for k in KW_HAUT:
-        if k in txt: return "haute", [k]
-    for k in KW_MOY:
-        if k in txt: return "moyenne", [k]
-    return "info", []
-
-def calc_score(t,d,sl,lv):
-    s = sl
-    txt = nml(f"{t} {d[:200]}")
-    if lv=="critique": s+=50
-    elif lv=="haute": s+=30
-    elif lv=="moyenne": s+=15
-    for k in ALL_KW:
-        if k in txt: s+=2
-    return min(s,200)
-
-def detect_cat(t,d):
-    txt = nml(f"{t} {d[:200]}")
-    cats = {"Politique":["gouvernement","president","ministre","election","vote","parti","loi","reforme"],"Securite":["armee","police","gendarmerie","securite","defense","terrorisme","attaque","criminalite"],"Cyber":["cyberattaque","piratage","hack","ransomware","virus","malware","breche","faille","anonymous","ddos"],"Economie":["economie","finance","banque","marche","investissement","pib","inflation","bceao","brvm"],"Diplomatie":["diplomatie","ambassade","onu","ua","cedeao","cooperation","sommet"],"Societe":["societe","education","sante","culture","religion","jeunesse"],"Justice":["justice","tribunal","proces","mandat","enquete","juge","prison"]}
-    for c,m in cats.items():
-        if any(k in txt for k in m): return c
-    return "General"
-
-def detect_reg(t,d,sr,sn=""):
-    txt = nml(f"{t} {d[:100]}")
-    ci = ["cote d'ivoire","abidjan","ivoirien","yopougon","cocody","bouake","gbagbo","ouattara","bedie","soro"]
-    af = ["afrique","mali","burkina","niger","guinee","senegal","ghana","nigeria","cameroun","rdc","sahel"]
-    for k in ci:
-        if k in txt: return "nat"
-    for k in af:
-        if k in txt: return "cont"
-    return sr
-
-def get_set(k, defv=""):
-    r = conn.execute("SELECT val FROM settings WHERE key=?",(k,)).fetchone()
-    return r["val"] if r else defv
-
-def set_set(k,v):
-    conn.execute("INSERT OR REPLACE INTO settings VALUES(?,?)",(k,v))
-    conn.commit()
-
-def scrape():
-    arts = []
-    sources = RSS
-    cs = conn.execute("SELECT * FROM custom_sources").fetchall()
-    for s in cs:
-        sources.append((s["name"],s["url"],s["region"] or "nat",s["level"] or 70))
-    hours = int(get_set("hours","24"))
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    for name,url,region,level in sources:
-        try:
-            time.sleep(0.03)
-            r = session.get(url, timeout=10)
-            if r.status_code!=200: continue
-            feed = feedparser.parse(r.content)
-            for e in feed.entries[:20]:
-                t = (e.get("title","") or "").strip()
-                l = (e.get("link","") or "").strip()
-                if not t or not l: continue
-                d = BeautifulSoup(e.get("summary","") or e.get("description","") or "","html.parser").get_text()[:400]
-                pub = datetime.now(timezone.utc)
-                if e.get("published_parsed"):
-                    try: pub = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
-                    except: pass
-                if pub < cutoff: continue
-                txt = nml(f"{t} {d}")
-                matched = [k for k in ALL_KW if k in txt]
-                if not matched: continue
-                uid = hashlib.sha256(f"{name}:{l}".encode()).hexdigest()[:16]
-                lv,kw = detect_lv(t,d)
-                reg = detect_reg(t,d,region,name)
-                cat = detect_cat(t,d)
-                sc = calc_score(t,d,level,lv)
-                arts.append({"id":uid,"title":t[:300],"url":l,"descr":d[:400],"source":name,"slevel":level,"region":reg,"level":lv,"score":sc,"cat":cat,"pub":pub.isoformat(),"img":""})
-        except: pass
-    return arts
-
-def save(arts):
-    saved=0
-    for a in arts:
-        try:
-            conn.execute("INSERT OR IGNORE INTO articles VALUES(?,?,?,?,?,?,?,?,?,?,?,datetime('now'),?,0)",(a["id"],a["title"],a["url"],a["descr"],a["source"],a["slevel"],a["region"],a["level"],a["score"],a["cat"],a["pub"],a["img"]))
-            if conn.total_changes: saved+=1
-        except: pass
-    conn.commit()
-    return saved
-
-def detect_alert():
-    hours = int(get_set("hours","24"))
-    cutoff = (datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
-    rows = conn.execute("SELECT * FROM articles WHERE level IN ('critique','haute') AND col > ? ORDER BY score DESC",(cutoff,)).fetchall()
-    groups = {}
-    for r in rows:
-        words = set(nml(r["title"]).split())
-        sw = sorted([w for w in words if len(w)>=4])[:5]
-        if not sw: continue
-        key = "_".join(sw)
-        if key not in groups: groups[key]=[]
-        groups[key].append(r)
-    nv=0
-    for k,items in groups.items():
-        if len(items)<2: continue
-        sources = list(set(i["source"] for i in items))
-        if len(sources)<2: continue
-        best = max(items, key=lambda x:x["score"])
-        aid = hashlib.sha256(f"al:{k}".encode()).hexdigest()[:16]
-        if conn.execute("SELECT id FROM alertes WHERE id=?",(aid,)).fetchone(): continue
-        nv_ = "critique" if any(i["level"]=="critique" for i in items) else "haute"
-        conn.execute("INSERT OR IGNORE INTO alertes VALUES(?,?,?,?,?,?,?,?,?,datetime('now'),0)",(aid,best["title"][:200],best["descr"][:300],nv_,best["score"]+len(sources)*10,best["cat"],json.dumps(sources),len(sources),best["url"]))
-        if conn.total_changes: nv+=1
-    conn.commit()
-    return nv
-
-def update_stats():
-    hours = int(get_set("hours","24"))
-    cutoff = (datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
-    t = conn.execute("SELECT COUNT(*) FROM articles WHERE col>?",(cutoff,)).fetchone()[0]
-    c = conn.execute("SELECT COUNT(*) FROM articles WHERE level='critique' AND col>?",(cutoff,)).fetchone()[0]
-    h = conn.execute("SELECT COUNT(*) FROM articles WHERE level='haute' AND col>?",(cutoff,)).fetchone()[0]
-    m = conn.execute("SELECT COUNT(*) FROM articles WHERE level='moyenne' AND col>?",(cutoff,)).fetchone()[0]
-    s = conn.execute("SELECT COUNT(DISTINCT source) FROM articles WHERE col>?",(cutoff,)).fetchone()[0]
-    a = conn.execute("SELECT COUNT(*) FROM alertes WHERE created>?",(cutoff,)).fetchone()[0]
-    conn.execute("INSERT INTO stats(total,crit,haut,moy,src,alrt) VALUES(?,?,?,?,?,?)",(t,c,h,m,s,a))
-    conn.commit()
-    return {"total":t,"critiques":c,"hautes":h,"moyennes":m,"sources":s,"alertes":a}
-
-class Scraper(threading.Thread):
-    def run(self):
-        while True:
-            start=time.time()
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Scraping {len(RSS)} sources...")
-            arts=scrape()
-            s=save(arts)
-            a=detect_alert()
-            st=update_stats()
-            print(f"  +{s} articles | {a} alertes | {st['total']} total")
-            if s>0: sse_queue.put({"type":"new_articles","data":{"count":s,"stats":st}})
-            if a>0: sse_queue.put({"type":"new_alertes","data":{"count":a}})
-            sse_queue.put({"type":"stats","data":st})
-            slp=max(1,int(get_set("interval","180"))-(time.time()-start))
-            time.sleep(slp)
-
-app = Flask(__name__)
-
-@app.route("/api/stats")
-def api_stats():
-    st=update_stats()
-    anl=conn.execute("SELECT COUNT(*) FROM alertes WHERE lu=0").fetchone()[0]
-    st["alertes_non_lues"]=anl
-    st["themes"]=["dark","clair","noir","bleu","vert","rouge","violet","or"]
-    st["current_theme"]=get_set("theme","dark")
-    st["interval"]=get_set("interval","180")
-    st["hours"]=get_set("hours","24")
-    return jsonify(st)
-
-@app.route("/api/articles")
-def api_articles():
-    lim=min(int(request.args.get("limit",50)),500)
-    off=int(request.args.get("offset",0))
-    lv=request.args.get("level","all")
-    reg=request.args.get("region","all")
-    cat=request.args.get("category","all")
-    src=request.args.get("source","all")
-    q=request.args.get("search","").strip()
-    sort=request.args.get("sort","score")
-    hours=int(get_set("hours","24"))
-    cutoff=(datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
-    query="SELECT * FROM articles WHERE col>?"
-    params=[cutoff]
-    if lv!="all": query+=" AND level=?"; params.append(lv)
-    if reg!="all": query+=" AND region=?"; params.append(reg)
-    if cat!="all": query+=" AND cat=?"; params.append(cat)
-    if src!="all": query+=" AND source=?"; params.append(src)
-    if q: query+=" AND (title LIKE ? OR descr LIKE ?)"; params.extend([f"%{q}%",f"%{q}%"])
-    total=conn.execute(query.replace("SELECT *","SELECT COUNT(*)"),params).fetchone()[0]
-    query+=f" ORDER BY {'pub' if sort=='date' else 'score'} DESC LIMIT ? OFFSET ?"
-    params.extend([lim,off])
-    rows=conn.execute(query,params).fetchall()
-    return jsonify({"articles":[dict(r) for r in rows],"total":total})
-
-@app.route("/api/alertes")
-def api_alertes():
-    hours=int(get_set("hours","24"))
-    cutoff=(datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
-    rows=conn.execute("SELECT * FROM alertes WHERE created>? ORDER BY score DESC LIMIT 100",(cutoff,)).fetchall()
-    al=[]
-    for r in rows:
-        a=dict(r)
-        a["sources"]=json.loads(a["sources"]) if a["sources"] else []
-        al.append(a)
-    return jsonify({"alertes":al})
-
-@app.route("/api/sources")
-def api_sources():
-    hours=int(get_set("hours","24"))
-    cutoff=(datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
-    rows=conn.execute("""SELECT source,slevel,region,COUNT(*) as ct,SUM(CASE WHEN level='critique' THEN 1 ELSE 0 END) as crit,SUM(CASE WHEN level='haute' THEN 1 ELSE 0 END) as haut FROM articles WHERE col>? GROUP BY source ORDER BY ct DESC""",(cutoff,)).fetchall()
-    cs=conn.execute("SELECT * FROM custom_sources").fetchall()
-    return jsonify({"sources":[dict(r) for r in rows],"custom":[dict(c) for c in cs]})
-
-@app.route("/api/categories")
-def api_categories():
-    hours=int(get_set("hours","24"))
-    cutoff=(datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
-    rows=conn.execute("SELECT cat,COUNT(*) as ct,SUM(CASE WHEN level='critique' THEN 1 ELSE 0 END) as crit FROM articles WHERE col>? GROUP BY cat ORDER BY ct DESC",(cutoff,)).fetchall()
-    return jsonify({"categories":[dict(r) for r in rows]})
-
-@app.route("/api/historique")
-def api_historique():
-    rows=conn.execute("SELECT * FROM stats ORDER BY ts DESC LIMIT 50").fetchall()
-    return jsonify({"historique":[dict(r) for r in rows]})
-
-@app.route("/api/settings",methods=["GET","POST"])
-def api_settings():
-    if request.method=="POST":
-        d=request.json
-        for k,v in d.items():
-            set_set(k,str(v))
-        return jsonify({"success":True})
-    return jsonify({k:get_set(k) for k in ["theme","interval","hours","max_articles","extract_images"]})
-
-@app.route("/api/sources/add",methods=["POST"])
-def api_add_source():
-    d=request.json
-    conn.execute("INSERT INTO custom_sources VALUES(?,?,?,?)",(d["name"],d["url"],d.get("region","nat"),int(d.get("level",70))))
-    conn.commit()
-    return jsonify({"success":True})
-
-@app.route("/api/sources/delete/<name>",methods=["DELETE"])
-def api_del_source(name):
-    conn.execute("DELETE FROM custom_sources WHERE name=?",(name,))
-    conn.commit()
-    return jsonify({"success":True})
-
-@app.route("/api/alertes/read-all",methods=["POST"])
-def api_alertes_read():
-    conn.execute("UPDATE alertes SET lu=1")
-    conn.commit()
-    return jsonify({"success":True})
-
-@app.route("/api/alerte/<id>/read",methods=["POST"])
-def api_alerte_read(id):
-    conn.execute("UPDATE alertes SET lu=1 WHERE id=?",(id,))
-    conn.commit()
-    return jsonify({"success":True})
-
-@app.route("/api/scan",methods=["POST"])
-def api_scan():
-    threading.Thread(target=lambda:(save(scrape()),detect_alert(),update_stats(),sse_queue.put({"type":"scan_done"})),daemon=True).start()
-    return jsonify({"success":True})
-
-@app.route("/api/logs")
-def api_logs():
-    hours=int(get_set("hours","24"))
-    cutoff=(datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
-    rows=conn.execute("SELECT strftime('%H:%M',ts) as time,total,crit,haut FROM stats ORDER BY ts DESC LIMIT 24").fetchall()
-    return jsonify({"logs":[dict(r) for r in reversed(rows)]})
-
-@app.route("/stream")
-def stream():
-    def gen():
-        while True:
-            try:
-                e=sse_queue.get(timeout=30)
-                yield f"data: {json.dumps(e,ensure_ascii=False)}\n\n"
-            except queue.Empty:
-                yield ": keepalive\n\n"
-    return Response(gen(),mimetype="text/event-stream",headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-
-@app.route("/")
-def index():
-    return render_template_string(HTML)
-
-# ═══════════════════════════════════════════
-# FRONTEND HTML COMPLET
-# ═══════════════════════════════════════════
-
-HTML = r"""<!DOCTYPE html><html lang="fr"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>⟡ NEXUS DIAMOND v5</title>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>CROGEND OSINT v10 — Cellule Renseignement</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box;font-family:system-ui,-apple-system,sans-serif;transition:background .2s,color .2s}
-:root{--bg:#060810;--sf:#0c0f1c;--cd:#121828;--cd2:#181f38;--tx:#eef2fa;--tx2:#8898c8;--ac:#00e5ff;--ac2:#ff6b35;--gr:#00ff88;--rd:#ff0030;--or:#ff6b00;--ye:#ffcc00;--pu:#aa66ff;--gd:#ffd700;--br:#1e2a4a;--r:12px}
-.theme-clair{--bg:#f0f2f8;--sf:#e4e7f0;--cd:#fff;--cd2:#f4f6fc;--tx:#1a1d2e;--tx2:#5a6a8a;--br:#d0d6e4}
-.theme-noir{--bg:#000;--sf:#0a0a0a;--cd:#111;--cd2:#1a1a1a;--tx:#fff;--tx2:#888;--br:#222}
-.theme-bleu{--bg:#0a1628;--sf:#0f1f3a;--cd:#142850;--cd2:#1a3366;--tx:#e0eeff;--tx2:#7a9ec8;--br:#1e4a7a}
-.theme-vert{--bg:#0a1a0a;--sf:#0f2a0f;--cd:#143a14;--cd2:#1a4a1a;--tx:#e0ffe0;--tx2:#7ac87a;--br:#1e4a1e}
-.theme-rouge{--bg:#1a0a0a;--sf:#2a0f0f;--cd:#3a1414;--cd2:#4a1a1a;--tx:#ffe0e0;--tx2:#c87a7a;--br:#4a1e1e}
-.theme-violet{--bg:#100a1a;--sf:#1a0f2a;--cd:#24143a;--cd2:#2e1a4a;--tx:#eee0ff;--tx2:#9a7ac8;--br:#3a1e5a}
-.theme-or{--bg:#1a180a;--sf:#2a2610;--cd:#3a3416;--cd2:#4a421c;--tx:#fffae0;--tx2:#c8b87a;--br:#5a4e1e}
-body{background:var(--bg);color:var(--tx);min-height:100vh}
-.nav{position:fixed;top:0;left:0;right:0;height:48px;background:rgba(8,11,22,.97);border-bottom:1px solid var(--br);display:flex;align-items:center;padding:0 12px;z-index:1000;gap:8px}
-.nav-logo{font-size:15px;font-weight:800;background:linear-gradient(135deg,#00e5ff,#aa66ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;white-space:nowrap}
-.nav-logo span{display:inline-block;width:28px;height:28px;line-height:28px;text-align:center;background:linear-gradient(135deg,#00e5ff,#aa66ff);border-radius:6px;color:#fff;font-size:12px;-webkit-text-fill-color:#fff;margin-right:4px}
-.nav-items{display:flex;gap:2px;overflow-x:auto;flex:1;scrollbar-width:none}
-.nav-items::-webkit-scrollbar{display:none}
-.nav-items button{padding:5px 10px;border-radius:6px;border:none;background:transparent;color:var(--tx2);font-size:10px;cursor:pointer;white-space:nowrap;font-weight:500}
-.nav-items button:hover{color:var(--tx);background:var(--cd)}
-.nav-items button.active{color:var(--ac);background:var(--cd)}
-.nav-info{display:flex;align-items:center;gap:6px;font-size:9px;color:var(--tx2);flex-shrink:0}
-.nav-info .dot{width:6px;height:6px;border-radius:50%;background:var(--gr);animation:pulse 1.5s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.content{padding:60px 12px 12px;max-width:1400px;margin:0 auto}
-.page{display:none}.page.active{display:block;animation:fade .15s}
-@keyframes fade{from{opacity:0}to{opacity:1}}
-.grid{display:grid;gap:6px}.g2{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}.g3{grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}.g4{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
-.card{background:var(--cd);border:1px solid var(--br);border-radius:var(--r);padding:12px}
-.card:hover{border-color:var(--ac);transform:translateY(-1px);box-shadow:0 4px 20px rgba(0,0,0,.4)}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:6px;margin-bottom:8px}
-.stat-card{background:var(--cd);border:1px solid var(--br);border-radius:10px;padding:10px 6px;text-align:center}
-.stat-card .num{font-size:20px;font-weight:800;color:var(--ac)}
-.stat-card .label{font-size:8px;color:var(--tx2);text-transform:uppercase;margin-top:1px}
-.badge{display:inline-flex;padding:1px 8px;border-radius:12px;font-size:8px;font-weight:700}
-.badge.critique{background:var(--rd);color:#fff}.badge.haute{background:var(--or);color:#fff}.badge.moyenne{background:var(--ye);color:#000}.badge.info{background:var(--ac);color:#000}
-.item{padding:6px 8px;background:var(--cd2);border-radius:6px;margin-bottom:3px;border-left:3px solid var(--ac);cursor:pointer}
-.item:hover{background:var(--cd)}
-.item.critique{border-left-color:var(--rd)}.item.haute{border-left-color:var(--or)}.item.moyenne{border-left-color:var(--ye)}
-.item-title{font-size:10px;font-weight:600;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
-.item-meta{font-size:8px;color:var(--tx2);margin-top:1px;display:flex;gap:4px;flex-wrap:wrap}
-.alert-box{padding:8px 12px;background:rgba(255,0,48,.08);border:1px solid var(--rd);border-radius:8px;margin-bottom:4px;cursor:pointer}
-.alert-box:hover{background:rgba(255,0,48,.12)}
-.alert-box.haute{background:rgba(255,107,0,.08);border-color:var(--or)}
-.alert-box.haute:hover{background:rgba(255,107,0,.12)}
-.tabs{display:flex;gap:2px;margin-bottom:8px;overflow-x:auto;scrollbar-width:none;border-bottom:1px solid var(--br)}
-.tabs button{padding:5px 12px;border:none;background:transparent;color:var(--tx2);font-size:9px;cursor:pointer;white-space:nowrap}
-.tabs button:hover{color:var(--tx)}
-.tabs button.active{background:var(--cd);color:var(--ac);border-radius:6px 6px 0 0}
-.search-bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px;padding:8px 12px;background:var(--cd);border-radius:var(--r);border:1px solid var(--br)}
-.search-bar input,.search-bar select{flex:1;min-width:80px;background:var(--sf);border:1px solid var(--br);padding:5px 8px;border-radius:6px;color:var(--tx);font-size:9px}
-.search-bar input:focus,.search-bar select:focus{border-color:var(--ac);outline:none}
-.btn{padding:5px 12px;border-radius:6px;border:none;font-size:9px;font-weight:600;cursor:pointer}
-.btn-primary{background:linear-gradient(135deg,#00e5ff,#aa66ff);color:#fff}
-.btn-primary:hover{box-shadow:0 2px 12px rgba(0,229,255,.3)}
-.btn-outline{background:transparent;border:1px solid var(--br);color:var(--tx2)}
-.btn-outline:hover{border-color:var(--ac);color:var(--ac)}
-.btn-danger{background:var(--rd);color:#fff}
-.btn-sm{padding:3px 8px;font-size:8px}
-.btn-lg{padding:8px 16px;font-size:11px}
-.floating-label{position:relative;margin-bottom:6px}
-.floating-label input,.floating-label textarea,.floating-label select{width:100%;background:var(--sf);border:1px solid var(--br);padding:10px 10px 4px;border-radius:6px;color:var(--tx);font-size:9px;outline:none}
-.floating-label input:focus,.floating-label textarea:focus,.floating-label select:focus{border-color:var(--ac);box-shadow:0 0 0 2px rgba(0,229,255,.1)}
-.floating-label label{position:absolute;top:8px;left:10px;font-size:9px;color:var(--tx2);pointer-events:none;transition:all .15s}
-.floating-label input:focus~label,.floating-label input:not(:placeholder-shown)~label,.floating-label textarea:focus~label,.floating-label textarea:not(:placeholder-shown)~label{top:2px;font-size:7px;color:var(--ac)}
-.modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.8);z-index:2000;align-items:center;justify-content:center;backdrop-filter:blur(8px)}
-.modal.open{display:flex}
-.modal-content{background:var(--cd);border:1px solid var(--br);border-radius:14px;padding:16px;max-width:500px;width:92%;max-height:80vh;overflow-y:auto;animation:slide .2s}
-@keyframes slide{from{transform:translateY(10px);opacity:0}to{transform:translateY(0);opacity:1}}
-.modal-close{position:absolute;top:8px;right:8px;background:var(--cd2);border:1px solid var(--br);color:var(--tx2);width:26px;height:26px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:11px}
-.modal-close:hover{background:var(--rd);color:#fff;border-color:var(--rd)}
-.toast{position:fixed;bottom:60px;left:50%;transform:translateX(-50%);background:var(--cd);border:1px solid var(--ac);padding:8px 16px;border-radius:8px;font-size:9px;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,.5);animation:tin .2s}
-@keyframes tin{from{opacity:0;transform:translateX(-50%) translateY(10px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
-::-webkit-scrollbar{width:3px;height:3px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--br);border-radius:3px}
-@media(max-width:768px){.nav-items{display:none}.stats{grid-template-columns:repeat(2,1fr)}.g2,.g3,.g4{grid-template-columns:1fr}}
-</style></head><body>
-<div class="nav">
-  <div class="nav-logo"><span>⟡</span> NEXUS DIAMOND v5</div>
-  <div class="nav-items" id="navItems"></div>
-  <div class="nav-info"><span class="dot"></span><span id="liveInfo">0 arts</span></div>
+*{margin:0;padding:0;box-sizing:border-box;font-family:system-ui,'Segoe UI',sans-serif}
+:root{--bg:#060a14;--bg2:#0c1322;--bg3:#111b2e;--card:#141f35;--card2:#1a2842;--border:#1e3352;--text:#e8edf5;--text2:#b0c4de;--text3:#6b8aaf;--orange:#f97316;--blue:#3b82f6;--cyan:#06b6d4;--emerald:#10b981;--red:#ef4444;--grad:linear-gradient(135deg,#f97316,#3b82f6);--radius:14px}
+body{background:var(--bg);color:var(--text);min-height:100vh}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:var(--bg2)}::-webkit-scrollbar-thumb{background:var(--border)}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 18px;border:none;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;transition:.25s;font-family:inherit}
+.btn-primary{background:var(--grad);color:#fff}.btn-primary:hover{transform:translateY(-2px);box-shadow:0 6px 24px rgba(249,115,22,.3)}
+.btn-success{background:linear-gradient(135deg,#10b981,#059669);color:#fff}
+.btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff}
+.btn-sm{padding:6px 14px;font-size:11px}.btn-xs{padding:3px 10px;font-size:9px}
+.btn-ghost{background:transparent;border:1px solid var(--border);color:var(--text2)}.btn-ghost:hover{border-color:var(--orange);color:var(--orange)}
+.btn-orange{background:linear-gradient(135deg,var(--orange),#ea580c);color:#fff}
+#sidebar{position:fixed;top:0;left:0;width:250px;height:100vh;background:var(--bg2);border-right:1px solid var(--border);z-index:100;overflow-y:auto;transition:.3s}
+#sidebar .brand{padding:18px 16px;font-size:20px;font-weight:900;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+#sidebar .brand .live{display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;-webkit-text-fill-color:initial;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 6px #10b981}50%{opacity:.4;box-shadow:0 0 16px #10b981}}
+.nav-item{display:flex;align-items:center;gap:10px;padding:10px 16px;color:var(--text2);font-size:13px;cursor:pointer;transition:.2s;border-left:3px solid transparent}
+.nav-item:hover{background:var(--bg3);color:var(--text)}
+.nav-item.active{background:var(--bg3);color:var(--orange);border-left-color:var(--orange)}
+.nav-item .badge{margin-left:auto;background:var(--red);color:#fff;font-size:8px;padding:2px 7px;border-radius:10px}
+.nav-item .badge.success{background:#10b981}.nav-item .badge.danger{background:#ef4444}
+#topbar{position:fixed;top:0;left:250px;right:0;height:56px;background:var(--bg2);border-bottom:1px solid var(--border);z-index:99;display:flex;align-items:center;justify-content:space-between;padding:0 18px}
+.menu-btn{display:none;background:none;border:none;color:var(--text);font-size:24px;cursor:pointer}
+@media(max-width:768px){#sidebar{transform:translateX(-100%)}#sidebar.open{transform:translateX(0)}#topbar{left:0}#main{margin-left:0}.menu-btn{display:block}}
+#main{margin-left:250px;margin-top:56px;padding:18px 20px;min-height:calc(100vh-56px)}
+.page{display:none}.page.active{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.page-title{font-size:24px;font-weight:800;margin-bottom:18px;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent;display:flex;align-items:center;gap:10px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:14px;transition:.2s}
+.card:hover{border-color:rgba(249,115,22,.2)}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:16px}
+.metric{background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:12px;text-align:center;cursor:pointer;transition:.2s}
+.metric:hover{transform:translateY(-2px);border-color:var(--orange)}
+.metric .val{font-size:24px;font-weight:800}.metric .lab{font-size:10px;color:var(--text3);margin-top:2px}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+@media(max-width:768px){.grid-2{grid-template-columns:1fr}}
+.result-card{background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:8px;cursor:pointer;transition:.2s;position:relative;overflow:hidden}
+.result-card:hover{border-color:var(--orange);transform:translateX(3px)}
+.sev-bar{position:absolute;top:0;left:0;width:3px;height:100%}
+.rc-src{display:flex;align-items:center;gap:6px;font-size:9px;color:var(--text3);margin-bottom:4px;flex-wrap:wrap}
+.rc-title{font-size:13px;font-weight:600;margin-bottom:3px;line-height:1.3}
+.rc-desc{font-size:10px;color:var(--text3);margin-bottom:4px}
+.rc-link{font-size:9px;margin-top:3px;padding:3px 8px;background:rgba(6,182,212,.06);border-radius:4px;display:inline-block}
+.rc-link a{color:var(--cyan);word-break:break-all}
+.kw{font-size:7px;color:var(--orange);background:rgba(249,115,22,.08);padding:1px 6px;border-radius:3px;display:inline-block;margin:1px}
+.filter-bar{display:flex;gap:4px;overflow-x:auto;padding:6px 0 12px}
+.filter-btn{padding:5px 14px;border-radius:16px;border:1px solid var(--border);background:var(--bg3);color:var(--text2);font-size:10px;cursor:pointer;transition:.2s;font-family:inherit;white-space:nowrap;flex-shrink:0}
+.filter-btn.active{background:var(--grad);color:#fff;border-color:transparent}
+input,select,textarea{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:9px 14px;color:var(--text);font-size:12px;font-family:inherit;width:100%;outline:none;transition:.2s}
+input:focus,select:focus,textarea:focus{border-color:var(--orange)}
+.gallery{display:flex;gap:10px;overflow-x:auto;padding:8px 0 12px}
+.gallery::-webkit-scrollbar{height:3px}
+.g-card{min-width:220px;max-width:260px;flex-shrink:0;background:var(--card2);border:1px solid var(--border);border-radius:10px;overflow:hidden;cursor:pointer;transition:.3s}
+.g-card:hover{border-color:var(--orange);transform:translateY(-4px);box-shadow:0 8px 24px rgba(249,115,22,.15)}
+.g-card .img{width:100%;height:140px;overflow:hidden;background:var(--bg3);display:flex;align-items:center;justify-content:center;font-size:30px;color:var(--text3)}
+.g-card .img img{width:100%;height:100%;object-fit:cover;transition:.4s}
+.g-card:hover .img img{transform:scale(1.08)}
+.g-card .body{padding:10px 12px}
+.g-card .body .t{font-size:11px;font-weight:600;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.g-card .body .s{font-size:8px;color:var(--text3);margin-top:3px}
+.sbadge{font-size:7px;padding:2px 7px;border-radius:4px;font-weight:700}
+.sbadge.ci{background:rgba(16,185,129,.15);color:#10b981}
+.sbadge.critical{background:rgba(239,68,68,.15);color:#ef4444;animation:pulse 2s infinite}
+.social-card{display:flex;align-items:center;gap:10px;padding:10px;background:var(--card2);border:1px solid var(--border);border-radius:8px;margin-bottom:6px}
+.social-card .ic{font-size:20px;width:36px;height:36px;display:flex;align-items:center;justify-content:center;background:var(--bg3);border-radius:8px;flex-shrink:0}
+.social-card .nm{font-size:13px;font-weight:600}
+.social-card .ur{font-size:8px;color:var(--text3);word-break:break-all}
+.source-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--border)}
+.source-item .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.source-item .nm{flex:1;font-size:12px;font-weight:500}
+.source-item .ct{font-size:9px;color:var(--text3)}
+.source-item .del{cursor:pointer;color:var(--text3);font-size:11px;opacity:.4}.source-item .del:hover{opacity:1;color:#ef4444}
+.preset-btn{font-size:9px;padding:4px 12px;border-radius:14px;border:1px solid var(--border);background:var(--bg3);color:var(--text2);cursor:pointer;transition:.2s;font-family:inherit}
+.preset-btn.active{background:var(--grad);color:#fff;border-color:transparent}
+.tag{display:inline-flex;align-items:center;gap:3px;font-size:9px;padding:2px 8px;background:rgba(249,115,22,.06);color:var(--orange);border-radius:5px;margin:2px;border:1px solid rgba(249,115,22,.1)}
+.tag .rem{cursor:pointer;font-size:7px;opacity:.4}.tag .rem:hover{opacity:1;color:var(--red)}
+.target-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}
+.target-card{background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:14px;text-align:center;cursor:pointer;transition:.2s}
+.target-card:hover{border-color:var(--orange);transform:translateY(-3px)}
+.target-card .ic{font-size:26px;margin-bottom:6px}.target-card .nm{font-size:13px;font-weight:600}
+.empty{padding:30px 20px;text-align:center;color:var(--text3)}
+.empty .ic{font-size:40px;margin-bottom:10px}.empty h3{font-size:15px;color:var(--text2);margin-bottom:4px}
+#toast{position:fixed;top:12px;right:12px;z-index:9999;display:flex;flex-direction:column;gap:6px;max-width:360px;pointer-events:none}
+.toast{padding:10px 16px;border-radius:8px;font-size:12px;font-weight:500;transition:.3s;box-shadow:0 10px 30px rgba(0,0,0,.5);pointer-events:auto;animation:tin .3s}
+.toast.s{background:rgba(6,95,70,.9);color:#a7f3d0;border:1px solid rgba(16,185,129,.3)}
+.toast.e{background:rgba(127,29,29,.9);color:#fecaca;border:1px solid rgba(239,68,68,.3)}
+.toast.w{background:rgba(113,63,18,.9);color:#fde68a;border:1px solid rgba(234,179,8,.3)}
+.toast.i{background:rgba(30,58,95,.9);color:#bae6fd;border:1px solid rgba(6,182,212,.3)}
+@keyframes tin{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+#overlay{display:none;position:fixed;inset:0;z-index:9998;background:rgba(6,10,20,.9);backdrop-filter:blur(8px);justify-content:center;align-items:center;flex-direction:column;gap:12px}
+#overlay.active{display:flex}#overlay .t{font-size:18px;font-weight:700}#overlay .s{font-size:11px;color:var(--text3)}
+#overlay .bar{width:280px;height:4px;background:var(--bg3);border-radius:2px;overflow:hidden}
+#overlay .bar div{height:100%;background:var(--grad);border-radius:2px;transition:.5s}
+#detail{position:fixed;top:56px;right:0;width:460px;max-width:100%;height:calc(100vh-56px);background:var(--card);border-left:1px solid var(--border);z-index:98;transform:translateX(100%);transition:.35s;overflow-y:auto;padding:18px}
+#detail.open{transform:translateX(0)}#detail .close{position:absolute;top:12px;right:12px;background:var(--bg3);border:none;color:var(--text3);width:28px;height:28px;border-radius:6px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+#detail .close:hover{color:var(--orange)}#detail .l{font-size:9px;color:var(--text3);text-transform:uppercase;margin-bottom:2px}#detail .v{font-size:13px;margin-bottom:10px;line-height:1.4}
+#detail .img{width:100%;max-height:200px;object-fit:cover;border-radius:8px;margin-bottom:12px}
+#progressBar{position:fixed;bottom:0;left:250px;right:0;height:3px;background:var(--bg3);z-index:9999}
+#progressBar div{height:100%;background:var(--grad);transition:.5s;width:0%}
+#progressInfo{position:fixed;bottom:6px;right:14px;z-index:9999;font-size:8px;color:var(--text3);background:rgba(12,19,34,.85);padding:3px 10px;border-radius:6px;display:none}
+#progressInfo.show{display:flex;gap:4px}
+.scan-log{background:var(--bg3);border-radius:8px;padding:10px;max-height:180px;overflow-y:auto;font-family:monospace;font-size:10px;line-height:1.6}
+.chart-bar{display:flex;align-items:center;gap:6px;margin:3px 0;font-size:9px}
+.chart-bar .l{width:70px;flex-shrink:0;color:var(--text3);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.chart-bar .tr{flex:1;height:14px;background:var(--bg);border-radius:3px;overflow:hidden}
+.chart-bar .tr .f{height:100%;border-radius:3px;transition:1s}
+.chart-bar .va{width:26px;text-align:right;color:var(--orange);font-weight:600}
+</style>
+</head>
+<body>
+
+<div id="toast"></div>
+<div id="overlay"><div class="t" id="olTitle">Analyse...</div><div class="bar"><div id="olProgress" style="width:0%"></div></div><div class="s" id="olSub">Patientez...</div></div>
+<div id="progressBar"><div id="progressInner"></div></div>
+<div id="progressInfo"><span id="piText">Initialisation</span><span id="piPct">0%</span></div>
+
+<nav id="sidebar">
+  <div class="brand">🕵️ CROGEND <span class="live"></span></div>
+  <div class="nav-item active" onclick="go('dashboard')">📊 Accueil <span class="badge" id="bdDash">0</span></div>
+  <div class="nav-item" onclick="go('scan')">🔍 Scan <span class="badge success" id="bdScan">Veille</span></div>
+  <div class="nav-item" onclick="go('sources')">📡 Sources <span class="badge" id="bdSrc">0</span></div>
+  <div class="nav-item" onclick="go('ci')">🇨🇮 Côte d'Ivoire <span class="badge danger" id="bdCI">0</span></div>
+  <div class="nav-item" onclick="go('afrique')">🌍 Afrique <span class="badge" id="bdAf">0</span></div>
+  <div class="nav-item" onclick="go('intl')">🌐 International <span class="badge" id="bdIntl">0</span></div>
+  <div class="nav-item" onclick="go('keywords')">🏷️ Mots-clés</div>
+  <div class="nav-item" onclick="go('targets')">🎯 Cibles</div>
+  <div class="nav-item" onclick="go('social')">🌐 Réseaux</div>
+  <div class="nav-item" onclick="go('search')">🔎 Recherche</div>
+  <div class="nav-item" onclick="go('tracking')">📊 Stats</div>
+  <div class="nav-item" onclick="go('alerts')">🔔 Alertes <span class="badge danger" id="bdAlert">0</span></div>
+  <div class="nav-item" onclick="go('fav')">⭐ Favoris</div>
+  <div class="nav-item" onclick="go('notes')">📝 Notes</div>
+  <div class="nav-item" onclick="go('reports')">📄 Rapports</div>
+  <div class="nav-item" onclick="go('settings')">⚙️ Paramètres</div>
+</nav>
+
+<header id="topbar">
+  <div class="left"><button class="menu-btn" onclick="S.classList.toggle('open')">☰</button><span id="status">🟢 Prêt</span></div>
+  <div class="right">
+    <span style="font-size:9px;color:var(--text3)" id="hCount">0</span>
+    <button class="btn btn-success btn-sm" id="scanBtn" onclick="toggleScan()">▶️ Lancer</button>
+    <button class="btn btn-orange btn-sm" onclick="force()">⏳ Forcer</button>
+  </div>
+</header>
+
+<div id="main">
+
+<div class="page active" id="p-dashboard">
+  <h1 class="page-title">📊 CROGEND Dashboard</h1>
+  <div class="metrics" id="metrics">
+    <div class="metric"><div class="val" style="background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent" id="mTotal">0</div><div class="lab">24h</div></div>
+    <div class="metric" onclick="go('ci')"><div class="val" style="color:#10b981" id="mCI">0</div><div class="lab">🇨🇮 CI</div></div>
+    <div class="metric" onclick="go('afrique')"><div class="val" style="color:#fbbf24" id="mAf">0</div><div class="lab">🌍 Afrique</div></div>
+    <div class="metric" onclick="go('intl')"><div class="val" style="color:#3b82f6" id="mIntl">0</div><div class="lab">🌐 Monde</div></div>
+    <div class="metric" onclick="go('alerts')"><div class="val" style="color:#ef4444" id="mCrit">0</div><div class="lab">🚨 Critique</div></div>
+    <div class="metric"><div class="val" style="color:#a78bfa" id="mSrc">0</div><div class="lab">📡 Sources</div></div>
+  </div>
+  <div class="filter-bar" id="dashFilters">
+    <button class="filter-btn active" onclick="df('all',this)">Tous</button>
+    <button class="filter-btn" onclick="df('ci',this)">🇨🇮 CI</button>
+    <button class="filter-btn" onclick="df('africa',this)">🌍 Afrique</button>
+    <button class="filter-btn" onclick="df('world',this)">🌐 Monde</button>
+    <button class="filter-btn" onclick="df('crit',this)">🔴 Critique</button>
+    <span style="width:1px;height:20px;background:var(--border);margin:0 4px"></span>
+    <button class="filter-btn" onclick="df('1h',this)">1h</button>
+    <button class="filter-btn" onclick="df('3h',this)">3h</button>
+    <button class="filter-btn" onclick="df('6h',this)">6h</button>
+    <button class="filter-btn active" onclick="df('24h',this)">24h</button>
+  </div>
+  <div id="dashResults"></div>
+  <div style="margin-top:16px"><div style="font-size:13px;font-weight:600;color:var(--text2);margin-bottom:8px">📸 Galerie</div><div class="gallery" id="gallery"></div></div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px">
+    <div class="card"><div class="card-title" style="font-size:12px;font-weight:600">📊 Activité</div><div id="activityChart"></div></div>
+    <div class="card"><div class="card-title" style="font-size:12px;font-weight:600">📡 Top sources</div><div id="topSourcesDash"></div></div>
+  </div>
 </div>
-<div class="content" id="content"></div>
+
+<div class="page" id="p-scan">
+  <h1 class="page-title">🔍 Scan</h1>
+  <div class="card" style="border-color:rgba(249,115,22,.3)">
+    <p class="text-sm" style="font-size:11px;color:var(--text3);margin-bottom:10px">Veille 24h/24 en arrière-plan. Navigation libre.</p>
+    <div class="flex" style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-success" id="scanCtrl" onclick="toggleScan()">▶️ Démarrer</button>
+      <button class="btn btn-orange" onclick="force()">⏳ Forcer</button>
+      <button class="btn btn-sm btn-ghost" onclick="stopScan()">⏹️ Stop</button>
+      <button class="btn btn-sm btn-ghost" onclick="test()">🧪 Test</button>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
+      <span style="font-size:10px;color:var(--text3)">Intervalle:</span>
+      <select id="scanIntv" style="width:60px" onchange="sv('intv',this.value)">
+        <option value="1">1m</option><option value="3">3m</option><option value="5" selected>5m</option><option value="10">10m</option>
+      </select>
+      <span style="font-size:10px;color:var(--text3)">Cache:</span>
+      <select id="scanCache" style="width:70px" onchange="sv('cache',this.value)">
+        <option value="500">500</option><option value="1000">1k</option><option value="1500" selected>1.5k</option><option value="3000">3k</option>
+      </select>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px">
+      <div style="background:var(--bg3);padding:8px;border-radius:6px;text-align:center"><div style="font-size:9px;color:var(--text3)">Cycles</div><div style="font-size:18px;font-weight:700" id="sCyc">0</div></div>
+      <div style="background:var(--bg3);padding:8px;border-radius:6px;text-align:center"><div style="font-size:9px;color:var(--text3)">Dernier</div><div style="font-size:16px;font-weight:600" id="sLast">--:--</div></div>
+      <div style="background:var(--bg3);padding:8px;border-radius:6px;text-align:center"><div style="font-size:9px;color:var(--text3)">Nouveaux</div><div style="font-size:18px;font-weight:700;color:var(--orange)" id="sNew">0</div></div>
+    </div>
+  </div>
+  <div class="card"><div class="card-title" style="font-size:12px;font-weight:600">📋 Journal</div><div class="scan-log" id="log"></div></div>
+</div>
+
+<div class="page" id="p-sources">
+  <h1 class="page-title">📡 Sources</h1>
+  <div class="grid-2">
+    <div class="card">
+      <div style="font-size:12px;font-weight:600;margin-bottom:8px">➕ Ajouter</div>
+      <div style="display:flex;gap:6px;margin-bottom:8px">
+        <input id="srcN" placeholder="Nom" style="flex:1">
+        <input id="srcU" placeholder="URL RSS" style="flex:2">
+      </div>
+      <button class="btn btn-orange w-full" onclick="addSrc()">➕ Ajouter</button>
+    </div>
+    <div class="card">
+      <div style="font-size:12px;font-weight:600;margin-bottom:8px">📂 Présélections</div>
+      <div style="display:flex;gap:4px;flex-wrap:wrap">
+        <button class="preset-btn" onclick="pre('ci',this)">🇨🇮 CI</button>
+        <button class="preset-btn" onclick="pre('gov',this)">🏛️ Gouvernement</button>
+        <button class="preset-btn" onclick="pre('gnews',this)">📰 Google</button>
+        <button class="preset-btn" onclick="pre('africa',this)">🌍 Afrique</button>
+        <button class="preset-btn" onclick="pre('world',this)">🌐 International</button>
+      </div>
+      <div id="presetList" style="margin-top:8px"></div>
+      <button class="btn btn-sm btn-blue" style="margin-top:8px;width:100%" onclick="loadAll()">📥 Charger tout</button>
+    </div>
+  </div>
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <span style="font-size:12px;font-weight:600">📡 Sources actives <span class="badge" id="srcCount">0</span></span>
+      <button class="btn btn-xs btn-danger" onclick="rmAllSrc()">🗑️</button>
+    </div>
+    <div id="srcList"></div>
+  </div>
+</div>
+
+<div class="page" id="p-ci">
+  <h1 class="page-title">🇨🇮 Côte d'Ivoire</h1>
+  <div class="filter-bar">
+    <button class="filter-btn active" onclick="ciF('all',this)">Tous</button>
+    <button class="filter-btn" onclick="ciF('securite',this)">🔒 Sécurité</button>
+    <button class="filter-btn" onclick="ciF('politique',this)">🏛️ Politique</button>
+    <button class="filter-btn" onclick="ciF('economie',this)">💰 Économie</button>
+    <button class="filter-btn" onclick="ciF('justice',this)">⚖️ Justice</button>
+  </div>
+  <div id="ciRes"></div>
+</div>
+
+<div class="page" id="p-afrique"><h1 class="page-title">🌍 Afrique</h1><div id="afRes"></div></div>
+<div class="page" id="p-intl"><h1 class="page-title">🌐 International</h1><div id="intlRes"></div></div>
+
+<div class="page" id="p-keywords">
+  <h1 class="page-title">🏷️ Mots-clés</h1>
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+      <span style="font-size:12px;font-weight:600">Surveillance <span class="badge" id="kwCount">0</span></span>
+      <div style="display:flex;gap:4px">
+        <button class="btn btn-xs btn-ghost" onclick="expKw()">📤</button>
+        <button class="btn btn-xs btn-ghost" onclick="impKw()">📥</button>
+      </div>
+    </div>
+    <div style="display:flex;gap:6px;margin-bottom:8px">
+      <input id="kwIn" placeholder="Ajouter..." style="flex:1" onkeydown="if(event.key==='Enter')addKw()">
+      <button class="btn btn-orange" onclick="addKw()">➕</button>
+    </div>
+    <div id="kwList" style="display:flex;gap:4px;flex-wrap:wrap"></div>
+    <div style="display:flex;gap:6px;margin-top:8px">
+      <button class="btn btn-sm btn-secondary" onclick="resetKw()">↩️ Défaut</button>
+      <button class="btn btn-sm btn-ghost" onclick="clrKw()">🗑️</button>
+    </div>
+  </div>
+</div>
+
+<div class="page" id="p-targets">
+  <h1 class="page-title">🎯 Cibles</h1>
+  <div class="card">
+    <div style="display:flex;gap:6px;">
+      <input id="tgN" placeholder="Nom" style="flex:1">
+      <input id="tgU" placeholder="URL" style="flex:1">
+      <select id="tgT" style="width:100px"><option value="personne">Personne</option><option value="organisation">Organisation</option><option value="site">Site</option></select>
+      <button class="btn btn-orange" onclick="addTg()">➕</button>
+    </div>
+  </div>
+  <div class="card"><div style="font-size:12px;font-weight:600;margin-bottom:8px">📋 Listes <span class="badge" id="tgCount">0</span></div><div class="target-grid" id="tgGrid"></div></div>
+</div>
+
+<div class="page" id="p-social">
+  <h1 class="page-title">🌐 Réseaux</h1>
+  <div class="grid-2">
+    <div class="card"><div style="font-size:12px;font-weight:600;margin-bottom:6px">📘 Facebook</div><div style="display:flex;gap:4px;margin-bottom:6px"><input id="fbU" placeholder="URL" style="flex:2"><input id="fbN" placeholder="Nom" style="flex:1"><button class="btn btn-sm btn-blue" onclick="addFB()">➕</button></div><div id="fbL"></div></div>
+    <div class="card"><div style="font-size:12px;font-weight:600;margin-bottom:6px">🐦 Twitter</div><div style="display:flex;gap:4px;margin-bottom:6px"><input id="twU" placeholder="URL" style="flex:2"><input id="twN" placeholder="Nom" style="flex:1"><button class="btn btn-sm btn-blue" onclick="addTW()">➕</button></div><div id="twL"></div></div>
+  </div>
+  <div class="grid-2">
+    <div class="card"><div style="font-size:12px;font-weight:600;margin-bottom:6px">✈️ Telegram</div><div style="display:flex;gap:4px;margin-bottom:6px"><input id="tgU" placeholder="URL" style="flex:2"><input id="tgN" placeholder="Nom" style="flex:1"><button class="btn btn-sm btn-blue" onclick="addTG()">➕</button></div><div id="tgL"></div></div>
+    <div class="card"><div style="font-size:12px;font-weight:600;margin-bottom:6px">▶️ YouTube</div><div style="display:flex;gap:4px;margin-bottom:6px"><input id="ytU" placeholder="URL" style="flex:2"><input id="ytN" placeholder="Nom" style="flex:1"><button class="btn btn-sm btn-blue" onclick="addYT()">➕</button></div><div id="ytL"></div></div>
+  </div>
+</div>
+
+<div class="page" id="p-search">
+  <h1 class="page-title">🔎 Recherche</h1>
+  <div class="card">
+    <div style="display:flex;gap:6px">
+      <input id="sq" placeholder="Rechercher..." style="flex:2" onkeydown="if(event.key==='Enter')searchW()">
+      <select id="sl" style="width:70px"><option value="fr">FR</option><option value="en">EN</option></select>
+      <input id="sc" placeholder="CI" style="width:40px;font-size:10px;padding:6px" value="CI">
+      <button class="btn btn-orange" onclick="searchW()">🔍</button>
+    </div>
+    <div id="sCount" style="font-size:9px;color:var(--text3);margin-top:6px"></div>
+    <div id="sRes" style="margin-top:8px"></div>
+  </div>
+</div>
+
+<div class="page" id="p-tracking">
+  <h1 class="page-title">📊 Stats</h1>
+  <div class="grid-2">
+    <div class="card"><div style="font-size:12px;font-weight:600;margin-bottom:8px">🏷️ Top mots-clés</div><div id="topKW"></div></div>
+    <div class="card"><div style="font-size:12px;font-weight:600;margin-bottom:8px">📡 Top sources</div><div id="topSRC"></div></div>
+  </div>
+  <div class="card"><div style="font-size:12px;font-weight:600;margin-bottom:8px">📅 Activité</div><div id="actChart"></div></div>
+</div>
+
+<div class="page" id="p-alerts"><h1 class="page-title">🔔 Alertes</h1><div style="display:flex;justify-content:flex-end;margin-bottom:8px"><button class="btn btn-danger btn-sm" onclick="clrAl()">🗑️</button></div><div class="card"><div id="alList"></div></div></div>
+<div class="page" id="p-fav"><h1 class="page-title">⭐ Favoris</h1><div style="display:flex;justify-content:flex-end;margin-bottom:8px"><button class="btn btn-danger btn-sm" onclick="clrFav()">🗑️</button></div><div class="card"><div id="favList"></div></div></div>
+
+<div class="page" id="p-notes">
+  <h1 class="page-title">📝 Notes</h1>
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+      <span style="font-size:12px;font-weight:600">Bloc-notes</span>
+      <div style="display:flex;gap:4px">
+        <button class="btn btn-success btn-sm" onclick="svNotes()">💾</button>
+        <button class="btn btn-orange btn-sm" onclick="expNotes()">📤</button>
+      </div>
+    </div>
+    <textarea id="ntArea" style="min-height:250px" placeholder="Notes de renseignement..."></textarea>
+    <div style="font-size:9px;color:var(--text3);margin-top:4px">💡 Ctrl+S · Auto 30s</div>
+  </div>
+</div>
+
+<div class="page" id="p-reports">
+  <h1 class="page-title">📄 Rapports</h1>
+  <div class="grid-2">
+    <div class="card"><div style="font-size:12px;font-weight:600;margin-bottom:6px">📊 Rapport 24h</div><p style="font-size:10px;color:var(--text3);margin-bottom:8px">Rapport Word classé CI → Afrique → International</p><button class="btn btn-orange" onclick="genReport()">📄 Générer</button></div>
+    <div class="card"><div style="font-size:12px;font-weight:600;margin-bottom:6px">💾 Configuration</div><p style="font-size:10px;color:var(--text3);margin-bottom:8px">Export/Import complet</p><div style="display:flex;gap:4px"><button class="btn btn-sm btn-secondary" onclick="expCfg()">📤</button><button class="btn btn-sm btn-ghost" onclick="impCfg()">📥</button></div></div>
+  </div>
+  <div class="card"><div style="font-size:12px;font-weight:600;margin-bottom:8px">📋 Historique</div><div id="repHist"></div></div>
+</div>
+
+<div class="page" id="p-settings">
+  <h1 class="page-title">⚙️ Paramètres</h1>
+  <div class="card">
+    <div style="font-size:12px;font-weight:600;margin-bottom:10px">🔍 Scan</div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <div><span style="font-size:10px;color:var(--text3)">Intervalle (min)</span><input id="setIntv" type="number" min="1" max="60" onchange="sv('intv',this.value)"></div>
+      <div><span style="font-size:10px;color:var(--text3)">Cache max</span><input id="setCache" type="number" min="100" max="10000" onchange="sv('cache',this.value)"></div>
+    </div>
+  </div>
+  <div class="card">
+    <div style="font-size:12px;font-weight:600;margin-bottom:8px;color:var(--red)">🛡️ Zone dangereuse</div>
+    <button class="btn btn-danger" onclick="nuke()">🗑️ Tout effacer</button>
+    <p style="font-size:9px;color:var(--text3);margin-top:4px">⚠️ Supprime TOUTES les données</p>
+  </div>
+</div>
+
+</div>
+
+<div id="detail">
+  <button class="close" onclick="closeD()">✕</button>
+  <div id="dTitle" style="font-size:16px;font-weight:700;margin-bottom:12px">Détails</div>
+  <div id="dBody"></div>
+</div>
 
 <script>
-// APP
-let state={page:'dashboard',articles:[],alertes:[],stats:{}};
-const pages=['dashboard','flux','alertes','sources','categories','settings','historique'];
-const icons={'dashboard':'📊','flux':'📡','alertes':'🚨','sources':'📰','categories':'📁','settings':'⚙️','historique':'📋'};
+/* ===== CROGEND v10 — Moteur complet et stable ===== */
 
-function init(){
-  const nav=document.getElementById('navItems');
-  nav.innerHTML=pages.map(p=>`<button class="${p==='dashboard'?'active':''}" onclick="showPage('${p}')">${icons[p]} ${p.charAt(0).toUpperCase()+p.slice(1)}</button>`).join('');
-  showPage('dashboard');
-  connectSSE();
-  setInterval(loadStats,10000);
+// STORAGE KEYS
+const SK = { r:'cg_r', s:'cg_s', k:'cg_k', f:'cg_f', t:'cg_t', g:'cg_g', y:'cg_y', v:'cg_v', a:'cg_a', p:'cg_p', tg:'cg_tg' };
+
+// CRITICAL KEYWORDS
+const CK = ["meurtre","assassinat","attentat","coup d'état","putsch","guerre","massacre","enlèvement","terrorisme","attaque","explosion","bombe","fusillade","tuerie","génocide","crime de guerre","torture","exécution","émeute","insurrection","rébellion","milice","urgence","catastrophe","incendie","inondation","accident","mort","décès","victime","arrestation","scandale","corruption","détournement","évasion","prison","révolte","pillage"];
+
+function getDefKws(){
+  return ["côte d'ivoire","abidjan","sécurité","attaque","cyber","hack","piratage","vol","fraude","meurtre","assassinat","violence","conflit","guerre","manifestation","politique","élection","présidentiel","gouvernement","ministre","démission","crise","scandale","corruption","détournement","justice","tribunal","procès","prison","enlèvement","disparition","terrorisme","djihadiste","militaire","armée","police","gendarmerie","braquage","drogue","trafic","blanchiment","argent","banque","finance","économie","investissement","dette","fmi","banque mondiale","afrique","ua","cedeao","onu","interpol","france","chine","russie","usa","europe","immigration","réfugié","santé","épidémie","vaccin","hôpital","éducation","emploi","chômage","transport","accident","incendie","inondation","catastrophe","climat","environnement","énergie","pétrole","gaz","mine","or","cacao","agriculture","technologie","numérique","internet","réseau","mobile","données","confidentialité","surveillance","espionnage","renseignement","osint","dark web","bitcoin","cryptomonnaie","ransomware","malware","phishing","ddos","vulnérabilité","zero day","exploit","backdoor","fausse nouvelle","désinformation","propagande","deepfake","influence","haine","racisme","discrimination","viol","agression","trafic humain","esclavage","mineur","enfant","femme","droit","loi","réforme","constitution","référendum","vote","parlement","député","sénat","développement","infrastructure","projet","aide","coopération","partenariat","sommet","conférence","diplomatie","ambassade","sanction","embargo","paix","réconciliation","amnistie","déplacé","aide humanitaire","ong","société civile","médias","presse","journal","radio","télévision","réseau social","facebook","twitter","whatsapp","telegram","youtube","tiktok","instagram","intelligence artificielle","ia","gpt","chatgpt","big data","cloud","sécurité informatique","pentest","cyberattaque","cybercriminalité","cyberdéfense","hacktivisme","anonymous","trafic d'armes","crise humanitaire","famine","pauvreté","inégalité","ethnie","tribu","religion","islam","chrétien","conflit intercommunautaire","coup d'état","mutinerie","rébellion","bombe","explosion","fusillade","massacre","torture","exécution","liberté de la presse","censure","coupure internet","cyber espionnage","cyber guerre","investigation numérique","authentification","mfa","2fa","biométrie","mot de passe","pare-feu","firewall","siem","wazuh","nmap","metasploit","crogend","dggn","sdao","gendarmerie","renseignement opérationnel","alerte","urgence","opération","forces spéciales","anti-terroriste","croat","service de renseignement","sécurité nationale","défense","frontière","douane","immigration","visa","passeport","identité","contrôle","surveillance","caméra","drone","satellite","géolocalisation","gps","piste","enquête","témoin","indice","preuve","perquisition","coopération judiciaire","extradition","mandat d'arrêt"];
 }
 
-function showPage(p){
-  state.page=p;
-  document.querySelectorAll('.nav-items button').forEach(b=>b.classList.remove('active'));
-  document.querySelector(`.nav-items button[onclick*="'${p}'"]`)?.classList.add('active');
-  const fns={dashboard:loadDashboard,flux:loadFlux,alertes:loadAlertes,sources:loadSources,categories:loadCategories,settings:loadSettings,historique:loadHistorique};
-  if(fns[p]) fns[p]();
+const PRESETS = {
+  // 🇨🇮 CI — existant (inchangé)
+  ci:[
+    {n:"Abidjan.net",u:"https://news.abidjan.net/rss"},
+    {n:"RTI Info",u:"https://www.rti.ci/rss"},
+    {n:"FratMat",u:"https://www.fratmat.info/feed"},
+    {n:"Koaci",u:"https://www.koaci.com/rss"},
+    {n:"7Info",u:"https://7info.ci/feed"},
+    {n:"AIP",u:"https://www.aip.ci/feed/"},
+    {n:"Linfodrome",u:"https://www.linfodrome.com/feed"},
+    {n:"Connection Ivoirienne",u:"https://www.connectionivoirienne.net/feed"},
+    {n:"Yeclo",u:"https://www.yeclo.com/feed"},
+    {n:"Afrikipresse",u:"https://www.afrikipresse.com/feed"},
+    {n:"Ivoire Business",u:"https://www.ivoirebusiness.net/feed"},
+    {n:"LeBabi",u:"https://www.lebabi.net/feed"},
+    {n:"Alerte Info",u:"https://www.alerte-info.net/feed"},
+    {n:"Gouv.ci",u:"https://www.gouv.ci/actualites?format=feed"},
+    {n:"LeMatin CI",u:"https://www.lematin.ci/feed"},
+    {n:"Infos Plus",u:"https://infosplusci.com/feed"},
+    {n:"Studiotivi",u:"https://studiotivi.com/feed"},
+    {n:"LeBledParle",u:"https://www.lebledparle.com/feed"},
+    {n:"Le Patriote",u:"https://lepatriote.ci/rss/latest-posts"},
+    {n:"L'Intelligent",u:"https://lintelligentdabidjan.ci/feed"},
+    {n:"Ivorian.net",u:"https://ivorian.net/feed"}
+  ],
+  // 🏛️ Gouvernement CI — enrichi
+  gov:[
+    {n:"Portail Gouv",u:"https://www.gouv.ci/rss"},
+    {n:"Primature",u:"https://www.primature.ci/feed"},
+    {n:"Ass Nat",u:"https://www.assnat.ci/feed"},
+    {n:"Sénat CI",u:"https://www.senat.ci/feed/"},
+    {n:"Présidence CI",u:"https://www.presidence.ci/feed/"}
+  ],
+  // 📰 Google — enrichi
+  gnews:[
+    {n:"Google News CI",u:"https://news.google.com/rss?hl=fr&gl=CI&ceid=CI:fr"},
+    {n:"Google Sécurité CI",u:"https://news.google.com/rss/search?q=s%C3%A9curit%C3%A9+C%C3%B4te+d%27Ivoire&hl=fr&gl=CI&ceid=CI:fr"},
+    {n:"Google Politique CI",u:"https://news.google.com/rss/search?q=Politique+C%C3%B4te+d%27Ivoire&hl=fr&gl=CI&ceid=CI:fr"},
+    {n:"Google Afrique",u:"https://news.google.com/rss/search?q=Afrique+s%C3%A9curit%C3%A9&hl=fr&gl=CI&ceid=CI:fr"},
+    {n:"Google International",u:"https://news.google.com/rss/search?q=intelligence+s%C3%A9curit%C3%A9+terrorisme+cyber&hl=fr&gl=FR&ceid=FR:fr"}
+  ],
+  // 🌍 AFRIQUE — NOUVEAU
+  africa:[
+    {n:"Africanews",u:"https://fr.africanews.com/feed/rss?themes=news"},
+    {n:"Jeune Afrique",u:"https://www.jeuneafrique.com/feed/"},
+    {n:"RFI Afrique",u:"https://www.rfi.fr/fr/afrique/rss"},
+    {n:"France24 Afrique",u:"https://www.france24.com/fr/afrique/rss"},
+    {n:"Le Monde Afrique",u:"https://www.lemonde.fr/afrique/rss_full.xml"},
+    {n:"BBC Afrique",u:"https://www.bbc.com/afrique/index.xml"},
+    {n:"TV5 Monde Afrique",u:"https://information.tv5monde.com/afrique/rss"},
+    {n:"Africa Intelligence",u:"https://www.africaintelligence.com/info/rss"},
+    {n:"Reuters Africa",u:"https://www.reuters.com/world/africa/rss"},
+    {n:"Al Jazeera Afrique",u:"https://www.aljazeera.com/xml/rss/all.xml"},
+    {n:"The Africa Report",u:"https://www.theafricareport.com/feed/"},
+    {n:"Bing Actu Afrique",u:"https://www.bing.com/news/search?q=afrique&qft=sortbydate%3d%221%22+interval%3d%227%22&form=YFNR&format=rss"},
+    {n:"Le360 Afrique",u:"https://www.le360.ma/feed"},
+    {n:"Actu Cameroun",u:"https://actucameroun.com/feed/"},
+    {n:"Senego",u:"https://senego.com/feed/"},
+    {n:"Koaci Afrique",u:"https://www.koaci.com/rss/category/afrique"}
+  ],
+  // 🌐 INTERNATIONAL — NOUVEAU
+  world:[
+    {n:"Le Monde",u:"https://www.lemonde.fr/rss/une.xml"},
+    {n:"Le Figaro",u:"https://www.lefigaro.fr/rss/figaro_une.xml"},
+    {n:"France24",u:"https://www.france24.com/fr/rss"},
+    {n:"Euronews",u:"https://www.euronews.com/rss?culture=fr"},
+    {n:"BBC News",u:"https://feeds.bbci.co.uk/news/rss.xml"},
+    {n:"The Guardian",u:"https://www.theguardian.com/world/rss"},
+    {n:"NY Times",u:"https://rss.nytimes.com/services/xml/rss/nyt/World.xml"},
+    {n:"Reuters",u:"https://www.reuters.com/world/rss"},
+    {n:"AP News",u:"https://feeds.ap.org/feeds/feed?q=world&format=rss"},
+    {n:"CNN",u:"http://rss.cnn.com/rss/edition.rss"},
+    {n:"Al Jazeera",u:"https://www.aljazeera.com/xml/rss/all.xml"},
+    {n:"DW",u:"https://rss.dw.com/rdf/rss-en-world"},
+    {n:"Le Point",u:"https://www.lepoint.fr/rss.xml"},
+    {n:"Libération",u:"https://www.liberation.fr/feed/"},
+    {n:"Courrier Intl",u:"https://www.courrierinternational.com/feed/all/rss.xml"}
+  ]
+};
+
+// STATE
+let S = { scan:false, timer:null, cycles:0, total:0, busy:false, last:null, lastN:0, dur:0, ok:0 };
+let D = { r:[], s:[], k:[], fb:[], tw:[], tg:[], yt:[], v:[], a:[], p:[], tg:[] };
+let DF = 'all', DTF = '24h', CF = 'all';
+
+// HELPERS
+function id(x){return document.getElementById(x)}
+function get(x){try{return JSON.parse(localStorage.getItem(x)||'[]')}catch(e){return[]}}
+function set(x,d){localStorage.setItem(x,JSON.stringify(d))}
+function load(){
+  Object.keys(SK).forEach(k=>{D[k]=get(SK[k])});
+  if(!D.k||!D.k.length)D.k=getDefKws();
+}
+function save(){Object.keys(SK).forEach(k=>{set(SK[k],D[k]||[])})}
+function esc(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML}
+function slp(ms){return new Promise(r=>setTimeout(r,ms))}
+function r24(d){if(!d)return false;try{return(Date.now()-new Date(d).getTime())<86400000}catch(e){return false}}
+function r24a(a){return a.filter(x=>r24(x.date))}
+function img(d){if(!d)return null;const m=d.match(/<img[^>]+src=["']([^"']+)["']/i);if(m&&m[1]&&!m[1].includes('google'))return m[1];return null}
+function sType(n){
+  const s=(n||'').toLowerCase();
+  const ciSources=['abidjan','rti','fratmat','koaci','7info','lebledparle','linfodrome','connection','yeclo','ivoire','lebabi','aip','alerte','afrik','gouv','primature','assnat','lematin','infos plus','studiotivi','patriote','intelligent','ivorian'];
+  const afSources=['africanews','jeune afrique','rfi afrique','france24 afrique','le monde afrique','bbc afrique','tv5','africa intelligence','reuters africa','al jazeera','africa report','bing actu afrique','le360','actu cameroun','senego','koaci afrique'];
+  if(ciSources.some(k=>s.includes(k))) return 'ci';
+  if(afSources.some(k=>s.includes(k))) return 'africa';
+  return 'world';
+}
+function sev(t,k){if(!t)return'low';const tl=t.toLowerCase();if(k&&k.some(x=>CK.includes(x)))return'critical';if(CK.some(x=>tl.includes(x)))return'critical';return'low'}
+
+// TOAST
+function to(m,t,d){
+  t=t||'i';d=d||3000;
+  const c=id('toast');if(!c)return;
+  const e=document.createElement('div');
+  e.className='toast '+{s:'s',e:'e',w:'w',i:'i',c:'e'}[t]||'i';
+  e.innerHTML='<span>'+(t==='s'?'✅':t==='e'?'❌':t==='w'?'⚠️':'ℹ️')+'</span> '+esc(m);
+  c.appendChild(e);
+  setTimeout(()=>{e.style.opacity='0';setTimeout(()=>e.remove(),300)},d);
 }
 
-function toast(m){const t=document.createElement('div');t.className='toast';t.textContent=m;document.body.appendChild(t);setTimeout(()=>t.remove(),2000)}
-function api(p){return fetch(p).then(r=>r.json())}
-function apiPost(p,d){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})}).then(r=>r.json())}
-
-async function loadStats(){
-  const s=await api('/api/stats');
-  state.stats=s;
-  document.getElementById('liveInfo').textContent=`${s.total||0} arts · ${s.alertes_non_lues||0} alertes`;
+function log(m){
+  const l=id('log');if(!l)return;
+  const t=new Date().toLocaleTimeString('fr-FR');
+  l.innerHTML+='<div>['+t+'] '+esc(m)+'</div>';l.scrollTop=l.scrollHeight;
 }
 
-async function loadDashboard(){
-  const s=state.stats.total?state.stats:await api('/api/stats');
-  Object.assign(state.stats,s);
-  const al=await api('/api/alertes');
-  const art=await api('/api/articles?limit=8&sort=score');
-  document.getElementById('content').innerHTML=`
-    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:8px">
-      <div><h2 style="font-size:16px">📊 Dashboard</h2><p style="font-size:9px;color:var(--tx2)">Tout est modifiable depuis l'interface</p></div>
-      <button class="btn btn-primary btn-sm" onclick="apiPost('/api/scan');toast('📡 Scan lancé')">📡 Scanner</button>
-    </div>
-    <div class="stats">${['total','critiques','hautes','moyennes','sources','alertes_non_lues'].map(k=>`<div class="stat-card"><div class="num" style="color:${k==='critiques'?'var(--rd)':k==='alertes_non_lues'?'var(--gd)':k==='hautes'?'var(--or)':'var(--ac)'}">${s[k]||0}</div><div class="label">${k.replace('_',' ')}</div></div>`).join('')}</div>
-    <div class="grid g2">
-      <div class="card"><div class="flex" style="display:flex;justify-content:space-between;margin-bottom:6px"><b style="font-size:11px">🚨 Alertes</b><span class="badge critique">${s.alertes_non_lues||0}</span></div>
-        <div id="dashAlertes">${(al.alertes||[]).slice(0,6).map(a=>`<div class="alert-box ${a.niveau}" onclick="apiPost('/api/alerte/${a.id}/read');loadDashboard()"><b style="font-size:9px">${a.niveau==='critique'?'🔴':'🟠'} ${(a.title||'').substring(0,70)}</b><div style="font-size:7px;color:var(--tx2)">${a.scount} sources · Score: ${a.score}</div></div>`).join('')||'<div style="font-size:9px;color:var(--tx2);text-align:center;padding:10px">✅ Aucune alerte</div>'}</div></div>
-      <div class="card"><div style="display:flex;justify-content:space-between;margin-bottom:6px"><b style="font-size:11px">🔥 Top articles</b></div>
-        <div id="dashArticles">${(art.articles||[]).slice(0,8).map(a=>`<div class="item ${a.level}" onclick="window.open('${a.url||''}','_blank')"><div class="item-title">${a.level==='critique'?'🔴':a.level==='haute'?'🟠':'🟡'} ${(a.title||'').substring(0,70)}</div><div class="item-meta"><span>${a.source}</span><span>·</span><span>${a.score}pts</span><span>·</span><span>${a.region}</span></div></div>`).join('')||'<div style="font-size:9px;color:var(--tx2);text-align:center;padding:10px">Lancez un scan</div>'}</div></div>
+function sts(t,s){
+  const e=id('status');if(e)e.textContent=t||'🟢 Prêt';
+}
+
+function showL(t,p){
+  const o=id('overlay');const ti=id('olTitle');const b=id('olProgress');const su=id('olSub');
+  if(ti)ti.textContent=t||'Analyse...';
+  if(o)o.classList.add('active');
+  if(b&&p!==null){const x=Math.min(Math.max(p,0),100);b.style.width=x+'%';if(su)su.textContent=Math.round(x)+'%'}
+  const pi=id('progressInner');if(pi)pi.style.width=(p||0)+'%';
+  const pi2=id('progressInfo');if(pi2)pi2.classList.add('show');
+  const pt=id('piText');if(pt)pt.textContent=t||'Analyse...';
+  const pp=id('piPct');if(pp)pp.textContent=Math.round(p||0)+'%';
+}
+
+function hideL(){
+  const o=id('overlay');if(o)o.classList.remove('active');
+  const pi=id('progressInner');if(pi)pi.style.width='0%';
+  const pi2=id('progressInfo');if(pi2)pi2.classList.remove('show');
+}
+
+function go(pg){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+  const p=id('p-'+pg);if(p)p.classList.add('active');
+  const map={dashboard:'Accueil',scan:'Scan',sources:'Sources',ci:'Côte',afrique:'Afrique',intl:'International',keywords:'Mots-clés',targets:'Cibles',social:'Réseaux',search:'Recherche',tracking:'Stats',alerts:'Alertes',fav:'Favoris',notes:'Notes',reports:'Rapports',settings:'Paramètres'};
+  const l=map[pg]||'';
+  document.querySelectorAll('.nav-item').forEach(n=>{if(l&&n.textContent.includes(l))n.classList.add('active')});
+  const s=id('sidebar');if(s&&s.classList.contains('open')&&window.innerWidth<=768)s.classList.remove('open');
+  if(pg==='ci')renderCI();if(pg==='afrique')renderAf();if(pg==='intl')renderIntl();if(pg==='tracking')renderTrack();
+  if(pg==='sources')renderSrc();if(pg==='reports')renderHist();up();
+}
+
+// PROXY
+const PX=[
+  {n:'rss2json',f:u=>`https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(u)}`},
+  {n:'feed2json',f:u=>`https://www.toptal.com/developers/feed2json/convert?url=${encodeURIComponent(u)}`},
+  {n:'rsstojson',f:u=>`https://rssjson.vercel.app/api?url=${encodeURIComponent(u)}`}
+];
+
+async function fetchRSS(u){
+  for(const p of PX){
+    try{
+      const c=new AbortController();const t=setTimeout(()=>c.abort(),8000);
+      const r=await fetch(p.f(u),{signal:c.signal});clearTimeout(t);
+      if(!r.ok)continue;
+      const j=await r.json();
+      if(j&&j.items&&j.items.length)return{items:j.items,proxy:p.n};
+    }catch(e){continue}
+  }
+  try{
+    const c=new AbortController();const t=setTimeout(()=>c.abort(),10000);
+    const r=await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,{signal:c.signal});clearTimeout(t);
+    if(!r.ok)throw'fail';const txt=await r.text();
+    const x=new DOMParser().parseFromString(txt,'text/xml');
+    const items=x.querySelectorAll('item');
+    if(items.length){const p=[];items.forEach(i=>{p.push({title:i.querySelector('title')?.textContent||'Sans titre',link:i.querySelector('link')?.textContent||'#',description:i.querySelector('description')?.textContent||'',pubDate:i.querySelector('pubDate')?.textContent||new Date().toISOString()})});if(p.length)return{items:p,proxy:'direct'}}
+  }catch(e){}
+  return null;
+}
+
+// ===== SCAN =====
+async function scan(){
+  if(S.busy){log('⏳ Déjà en cours');return}
+  S.busy=true;const st=Date.now();
+  const srcs=D.s.filter(s=>s.u&&s.u.startsWith('http'));
+  const max=parseInt(localStorage.getItem('cg_cache')||'1500');
+  const par=3;
+  showL('🔍 '+srcs.length+' sources...',0);sts('🔴 Scan...',true);
+  log('🚀 Cycle #'+(S.cycles+1)+' — '+srcs.length+' sources');
+  let total=0,ok=0;
+  for(let i=0;i<srcs.length;i+=par){
+    const batch=srcs.slice(i,i+par);
+    const res=await Promise.all(batch.map(async src=>{
+      try{
+        const r=await fetchRSS(src.u);
+        if(!r||!r.items||!r.items.length)return 0;
+        let f=0;
+        for(const item of r.items){
+          if(max>0&&D.r.length>=max)break;
+          const txt=((item.title||'')+' '+(item.description||'')).toLowerCase();
+          const m=D.k.filter(k=>txt.includes(k.toLowerCase()));
+          if(m.length){
+            const link=item.link||item.guid||item.url||'#';
+            if(!D.r.some(x=>x.link===link&&link!=='#')){
+              D.r.unshift({title:item.title||'Sans titre',link,description:(item.description||'').substring(0,600),source:src.n,date:item.pubDate||new Date().toISOString(),keywords:m.slice(0,8),proxy:r.proxy,severity:sev(txt,m),sourceType:sType(src.n)});
+              f++;
+            }
+          }
+        }
+        if(f>0)ok++;return f;
+      }catch(e){return 0}
+    }));
+    res.forEach(f=>total+=f);
+    const pct=Math.min(((i+par)/srcs.length)*100,100);
+    showL('📡 '+Math.min(i+par,srcs.length)+'/'+srcs.length,pct);
+    await slp(20);
+  }
+  if(total>0){const m=parseInt(localStorage.getItem('cg_cache')||'1500');if(m>0&&D.r.length>m)D.r=D.r.slice(0,m);save()}
+  const dur=((Date.now()-st)/1000).toFixed(1);
+  S.cycles++;S.total+=total;S.last=new Date().toISOString();S.lastN=total;S.dur=dur;S.ok=ok;S.busy=false;
+  hideL();up();log('✅ Cycle #'+S.cycles+' — '+total+' résultats en '+dur+'s ('+ok+'/'+srcs.length+' sources)');
+  sts('🟢 '+(total?'+'+total:'OK'),S.scan);
+  if(total>0){const c=D.r.slice(0,total).filter(x=>x.severity==='critical');if(c.length)addA(c.length+' alerte(s)','c',c.slice(0,3).map(x=>x.title).join(', '));to('✅ '+total+' résultat(s)','s')}
+}
+
+function force(){if(!S.busy)scan();else to('⚠️ En cours','w')}
+
+async function test(){
+  to('🧪 Test...','i');log('🧪 Test Google News');
+  const r=await fetchRSS('https://news.google.com/rss?hl=fr&gl=CI&ceid=CI:fr');
+  if(r&&r.items&&r.items.length){log('✅ '+r.items.length+' articles ('+r.proxy+')');to('✅ OK','s')}
+  else{log('❌ Échec');to('❌ Test échoué','e')}
+}
+
+function toggleScan(){
+  S.scan=!S.scan;
+  ['scanBtn','scanCtrl'].forEach(x=>{const b=id(x);if(b)b.innerHTML=S.scan?'⏸ Pause':'▶️ Lancer'});
+  const b2=id('bdScan');if(b2){b2.textContent=S.scan?'Actif':'Veille';b2.className='badge '+(S.scan?'success':'')}
+  if(S.scan){
+    if(S.timer)clearInterval(S.timer);
+    const iv=(parseFloat(id('scanIntv')?.value||'5'))*60000;
+    S.timer=setInterval(()=>{if(!S.busy&&S.scan)scan()},iv);
+    if(!S.busy)scan();log('▶️ Auto activé');to('▶️ Veille activée','s');
+  }else{if(S.timer){clearInterval(S.timer);S.timer=null}log('⏸ Désactivé');to('⏸ Veille désactivée','w')}
+  up()
+}
+
+function stopScan(){if(S.scan)toggleScan();if(S.busy){S.busy=false;hideL()}}
+
+// ===== UI =====
+function up(){
+  const r=r24a(D.r);const ci=r.filter(x=>x.sourceType==='ci');const crit=r.filter(x=>x.severity==='critical');
+  const $=id;
+  const safe=(e,v)=>{const x=$(e);if(x)x.textContent=v};
+  safe('mTotal',r.length);safe('mCI',ci.length);safe('mAf',r.filter(x=>x.sourceType==='africa').length);safe('mIntl',r.filter(x=>x.sourceType==='world').length);safe('mCrit',crit.length);safe('mSrc',D.s.length);
+  safe('bdDash',r.length);safe('bdSrc',D.s.length);safe('bdCI',ci.length);safe('bdAf',r.filter(x=>x.sourceType==='africa').length);safe('bdIntl',r.filter(x=>x.sourceType==='world').length);
+  const ba=$('bdAlert');if(ba){ba.textContent=crit.length;ba.className='badge danger'}
+  safe('hCount',r.length+' 24h');
+  safe('sCyc',S.cycles);safe('sLast',S.last?new Date(S.last).toLocaleTimeString('fr-FR'):'--:--');safe('sNew',S.lastN);
+  const sb=$('bdScan');if(sb){sb.textContent=S.scan?'Actif':'Veille';sb.className='badge '+(S.scan?'success':'')}
+  renderDash();renderGal();renderKW();renderSrc();renderAl();
+  const tc=id('tgCount');if(tc)tc.textContent=D.tg.length;
+  const dv=id('dashResults');if(dv)renderDash();
+  const pi=id('progressInner');
+  if(pi&&!S.busy){pi.style.width='0%';const pi2=id('progressInfo');if(pi2)pi2.classList.remove('show')}
+}
+
+// ===== RENDER DASH =====
+function renderDash(){
+  const el=id('dashResults');if(!el)return;
+  let r=r24a(D.r);
+  if(DF==='ci')r=r.filter(x=>x.sourceType==='ci');
+  else if(DF==='africa')r=r.filter(x=>x.sourceType==='africa');
+  else if(DF==='world')r=r.filter(x=>x.sourceType==='world');
+  else if(DF==='crit')r=r.filter(x=>x.severity==='critical');
+  if(DTF==='1h')r=r.filter(x=>{try{return(Date.now()-new Date(x.date).getTime())<3600000}catch(e){return false}});
+  else if(DTF==='3h')r=r.filter(x=>{try{return(Date.now()-new Date(x.date).getTime())<10800000}catch(e){return false}});
+  else if(DTF==='6h')r=r.filter(x=>{try{return(Date.now()-new Date(x.date).getTime())<21600000}catch(e){return false}});
+  if(!r.length){el.innerHTML='<div class="empty"><div class="ic">📊</div><h3>Aucun résultat</h3><p>Aucun résultat pour ces filtres</p></div>';return}
+  el.innerHTML=r.slice(0,50).map((x,i)=>{
+    const sevCls=x.severity==='critical'?' style="background:#ef4444"':'';
+    return `<div class="result-card anim-fade" onclick="openD(${D.r.indexOf(x)})">
+      <div class="sev-bar"${sevCls}></div>
+      <div class="rc-src">
+        <span class="sbadge ${x.sourceType==='ci'?'ci':x.severity==='critical'?'critical':'rss'}">${x.sourceType==='ci'?'🇨🇮 CI':x.severity==='critical'?'🔴 CRIT':'📰'}</span>
+        <span>📡 ${esc(x.source)}</span>
+        <span>${x.date?new Date(x.date).toLocaleTimeString('fr-FR'):''}</span>
+        <span style="margin-left:auto;font-size:8px;color:var(--text3)">${x.proxy||''}</span>
+      </div>
+      <div class="rc-title">${esc(x.title||'')}</div>
+      <div class="rc-desc">${esc((x.description||'').substring(0,200))}</div>
+      ${x.keywords&&x.keywords.length?`<div>${x.keywords.slice(0,5).map(k=>`<span class="kw">#${esc(k)}</span>`).join('')}</div>`:''}
+      <div class="rc-link"><a href="${x.link||'#'}" target="_blank" onclick="event.stopPropagation()">🔗 ${(x.link||'').substring(0,60)}</a></div>
+    </div>`
+  }).join('');
+}
+
+function df(f,btn){
+  if(['all','ci','africa','world','crit'].includes(f))DF=f;
+  else DTF=f;
+  document.querySelectorAll('#dashFilters .filter-btn').forEach(b=>b.classList.remove('active'));
+  if(btn)btn.classList.add('active');
+  renderDash();
+}
+
+function renderCI(){
+  const el=id('ciRes');if(!el)return;
+  let r=D.r.filter(x=>x.sourceType==='ci'&&r24(x.date));
+  if(CF!=='all'){const t=CF.toLowerCase();r=r.filter(x=>(x.title||'').toLowerCase().includes(t)||(x.description||'').toLowerCase().includes(t))}
+  if(!r.length){el.innerHTML='<div class="empty"><div class="ic">🇨🇮</div><h3>Aucun résultat CI</h3></div>';return}
+  el.innerHTML=r.slice(0,50).map((x,i)=>{
+    return `<div class="result-card anim-fade" onclick="openD(${D.r.indexOf(x)})">
+      <div class="rc-src"><span class="sbadge ci">🇨🇮 CI</span><span>📡 ${esc(x.source)}</span><span>${x.date?new Date(x.date).toLocaleTimeString('fr-FR'):''}</span></div>
+      <div class="rc-title">${esc(x.title||'')}</div>
+      <div class="rc-desc">${esc((x.description||'').substring(0,200))}</div>
+      <div class="rc-link"><a href="${x.link||'#'}" target="_blank">🔗 ${(x.link||'').substring(0,60)}</a></div>
+    </div>`
+  }).join('');
+}
+
+function ciF(f,btn){
+  CF=f;
+  document.querySelectorAll('#p-ci .filter-btn').forEach(b=>b.classList.remove('active'));
+  if(btn)btn.classList.add('active');
+  renderCI();
+}
+
+function renderAf(){
+  const el=id('afRes');if(!el)return;
+  let r=D.r.filter(x=>x.sourceType==='africa'&&r24(x.date));
+  if(!r.length){el.innerHTML='<div class="empty"><div class="ic">🌍</div><h3>Aucun résultat Afrique</h3></div>';return}
+  el.innerHTML=r.slice(0,50).map(x=>{
+    return `<div class="result-card anim-fade" onclick="openD(${D.r.indexOf(x)})">
+      <div class="rc-src"><span class="sbadge rss">🌍 Afrique</span><span>📡 ${esc(x.source)}</span><span>${x.date?new Date(x.date).toLocaleTimeString('fr-FR'):''}</span></div>
+      <div class="rc-title">${esc(x.title||'')}</div>
+      <div class="rc-desc">${esc((x.description||'').substring(0,200))}</div>
+    </div>`
+  }).join('');
+}
+
+function renderIntl(){
+  const el=id('intlRes');if(!el)return;
+  let r=D.r.filter(x=>x.sourceType==='world'&&r24(x.date));
+  if(!r.length){el.innerHTML='<div class="empty"><div class="ic">🌐</div><h3>Aucun résultat International</h3></div>';return}
+  el.innerHTML=r.slice(0,50).map(x=>{
+    return `<div class="result-card anim-fade" onclick="openD(${D.r.indexOf(x)})">
+      <div class="rc-src"><span class="sbadge rss">🌐 International</span><span>📡 ${esc(x.source)}</span><span>${x.date?new Date(x.date).toLocaleTimeString('fr-FR'):''}</span></div>
+      <div class="rc-title">${esc(x.title||'')}</div>
+      <div class="rc-desc">${esc((x.description||'').substring(0,200))}</div>
+    </div>`
+  }).join('');
+}
+
+function renderGal(){
+  const el=id('gallery');if(!el)return;
+  const imgs=D.r.filter(x=>{const m=(x.description||'').match(/<img[^>]+src=["']([^"']+)["']/i);return m&&m[1]&&!m[1].includes('google')}).slice(0,12);
+  if(!imgs.length){el.innerHTML='<div style="color:var(--text3);font-size:11px;padding:10px">Aucune image dans les résultats</div>';return}
+  el.innerHTML=imgs.map(x=>{
+    const src=(x.description||'').match(/<img[^>]+src=["']([^"']+)["']/i);
+    const u=src?src[1]:null;
+    return u?`<div class="g-card" onclick="openD(${D.r.indexOf(x)})">
+      <div class="img"><img src="${esc(u)}" loading="lazy" onerror="this.parentElement.innerHTML='📷'" alt=""></div>
+      <div class="body"><div class="t">${esc(x.title||'')}</div><div class="s">📡 ${esc(x.source)}</div></div>
+    </div>`:'';
+  }).join('');
+}
+
+// ===== DETAIL =====
+function openD(idx){
+  const x=D.r[idx];if(!x)return;
+  const p=id('detail');const t=id('dTitle');const b=id('dBody');
+  if(!p||!b)return;
+  if(t)t.textContent=esc(x.title||'');
+  const kws=(x.keywords||[]).map(k=>`<span class="kw">#${esc(k)}</span>`).join('');
+  const im=(x.description||'').match(/<img[^>]+src=["']([^"']+)["']/i);
+  const imHtml=im?`<img class="img" src="${esc(im[1])}" onerror="this.style.display='none'" alt="">`:'';
+  const sevCls=x.severity==='critical'?'color:#ef4444':'color:var(--text3)';
+  const isFav=D.p.includes(idx);
+  b.innerHTML=`
+    ${imHtml}
+    <div class="l">Source</div><div class="v">📡 ${esc(x.source)} ${x.proxy?'· '+x.proxy:''}</div>
+    <div class="l">Date</div><div class="v">${x.date?new Date(x.date).toLocaleString('fr-FR'):'Inconnue'}</div>
+    <div class="l">Sévérité</div><div class="v" style="${sevCls}">${x.severity==='critical'?'🔴 CRITIQUE':'🟢 Normal'}</div>
+    ${kws?`<div class="l">Mots-clés</div><div class="v">${kws}</div>`:''}
+    <div class="l">Description</div><div class="v">${esc((x.description||'').substring(0,800))}</div>
+    <div class="l">Lien</div><div class="v" style="word-break:break-all"><a href="${x.link||'#'}" target="_blank">${esc(x.link||'#')}</a></div>
+    <div style="display:flex;gap:6px;margin-top:12px">
+      <button class="btn btn-sm ${isFav?'btn-danger':'btn-secondary'}" onclick="togFav(${idx})">${isFav?'⭐ Retirer':'⭐ Favori'}</button>
+      <button class="btn btn-sm btn-ghost" onclick="share(${idx})">📤 Partager</button>
     </div>`;
+  p.classList.add('open');
 }
 
-async function loadFlux(){
-  const q=document.getElementById('fSearch')?.value||'';
-  const lv=document.getElementById('fLevel')?.value||'all';
-  const reg=document.getElementById('fRegion')?.value||'all';
-  const cat=document.getElementById('fCat')?.value||'all';
-  let url=`/api/articles?limit=60&sort=score&level=${lv}&region=${reg}&category=${cat}`;
-  if(q) url+=`&search=${encodeURIComponent(q)}`;
-  const data=await api(url);
-  document.getElementById('content').innerHTML=`
-    <h2 style="font-size:15px;margin-bottom:4px">📡 Flux temps réel</h2>
-    <div class="search-bar">
-      <input id="fSearch" placeholder="🔍 Mots-clés..." oninput="debounce(loadFlux,300)" value="${q}">
-      <select id="fLevel" onchange="loadFlux()"><option value="all">Tous</option><option value="critique" ${lv==='critique'?'selected':''}>🔴 Critique</option><option value="haute" ${lv==='haute'?'selected':''}>🟠 Haute</option><option value="moyenne" ${lv==='moyenne'?'selected':''}>🟡 Moyenne</option><option value="info" ${lv==='info'?'selected':''}>🗞️ Info</option></select>
-      <select id="fRegion" onchange="loadFlux()"><option value="all">🌍 Toutes</option><option value="nat" ${reg==='nat'?'selected':''}>🔵 National</option><option value="cont" ${reg==='cont'?'selected':''}>🟢 Continental</option><option value="inter" ${reg==='inter'?'selected':''}>🔴 International</option></select>
-      <select id="fCat" onchange="loadFlux()"><option value="all">📁 Toutes</option>${['Politique','Securite','Cyber','Economie','Diplomatie','Societe','Justice'].map(c=>`<option value="${c}" ${cat===c?'selected':''}>${c}</option>`).join('')}</select>
+function closeD(){const p=id('detail');if(p)p.classList.remove('open')}
+
+function togFav(idx){
+  const i=D.p.indexOf(idx);
+  if(i>-1){D.p.splice(i,1);to('⭐ Retiré','w')}
+  else{D.p.push(idx);to('⭐ Ajouté','s')}
+  save();openD(idx);renderFav();up()
+}
+
+function share(idx){
+  const x=D.r[idx];if(!x)return;
+  if(navigator.share){navigator.share({title:x.title,text:x.description?.substring(0,200),url:x.link}).catch(()=>{})}
+  else{navigator.clipboard.writeText(x.title+'\n'+x.link).then(()=>to('📋 Copié','s')).catch(()=>to('❌ Erreur','e'))}
+}
+
+// ===== SOURCES =====
+function renderSrc(){
+  const el=id('srcList');if(!el)return;
+  const c=id('srcCount');if(c)c.textContent=D.s.length;
+  if(!D.s.length){el.innerHTML='<div class="empty"><div class="ic">📡</div><h3>Aucune source</h3></div>';return}
+  const sc={};D.r.forEach(r=>{sc[r.source]=(sc[r.source]||0)+1});
+  el.innerHTML=D.s.map(s=>{
+    const n=sc[s.n]||0;
+    return `<div class="source-item">
+      <span class="dot" style="background:${n>0?'#10b981':'var(--text3)'}"></span>
+      <span class="nm">${esc(s.n)}</span>
+      <span class="ct">${n>0?n+' résultats':'En attente'}</span>
+      <span class="del" onclick="rmSrc('${s.u.replace(/'/g,"\\'")}')">✕</span>
+    </div>`
+  }).join('');
+}
+
+function addSrc(){
+  const n=id('srcN').value.trim();const u=id('srcU').value.trim();
+  if(!u){to('❌ URL requise','e');return}
+  if(!u.startsWith('http')){to('❌ URL invalide','e');return}
+  if(D.s.find(x=>x.u===u)){to('⚠️ Existe déjà','w');return}
+  const nn=n||u.substring(0,30);
+  D.s.push({n:nn,u:u,t:'rss'});
+  save();renderSrc();id('srcN').value='';id('srcU').value='';to('✅ Source ajoutée','s')
+}
+
+function rmSrc(u){D.s=D.s.filter(s=>s.u!==u);save();renderSrc();to('🗑️ Supprimée','w')}
+function rmAllSrc(){if(!confirm('⚠️ Supprimer TOUTES les sources ?'))return;D.s=[];save();renderSrc();to('🗑️ Tout vidé','w')}
+
+function pre(k,btn){
+  document.querySelectorAll('.preset-btn').forEach(b=>b.classList.remove('active'));
+  if(btn)btn.classList.add('active');
+  const el=id('presetList');if(!el)return;
+  const items=PRESETS[k]||[];
+  if(!items.length){el.innerHTML='<p style="font-size:10px;color:var(--text3)">Aucune</p>';return}
+  el.innerHTML=items.map(s=>{
+    const ex=D.s.find(x=>x.u===s.u);
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:11px;border-bottom:1px solid var(--border)">
+      <span>${esc(s.n)}</span>
+      <button class="btn btn-xs ${ex?'btn-success':'btn-ghost'}" onclick="${ex?'':'addPre(\''+s.n.replace(/'/g,"\\'")+'\',\''+s.u.replace(/'/g,"\\'")+'\')'}">${ex?'✅':'➕'}</button>
+    </div>`
+  }).join('');
+}
+
+function addPre(n,u){
+  if(D.s.find(x=>x.u===u)){to('⚠️ Déjà présent','w');return}
+  D.s.push({n,u,t:'rss'});save();renderSrc();to('✅ '+n,'s');pre('ci',document.querySelector('.preset-btn'))
+}
+
+function loadAll(){
+  let c=0;
+  Object.values(PRESETS).forEach(cat=>cat.forEach(s=>{if(!D.s.find(x=>x.u===s.u)){D.s.push({n:s.n,u:s.u,t:'rss'});c++}}));
+  if(c){save();renderSrc();to('📥 '+c+' chargées','s')}else to('Rien à ajouter','w')
+}
+
+// ===== KEYWORDS =====
+function renderKW(){
+  const el=id('kwList');if(!el)return;
+  const c=id('kwCount');if(c)c.textContent=D.k.length;
+  if(!D.k.length){el.innerHTML='<span style="font-size:10px;color:var(--text3)">Aucun mot-clé</span>';return}
+  el.innerHTML=D.k.map(k=>`<span class="tag">${esc(k)} <span class="rem" onclick="rmKw('${k.replace(/'/g,"\\'")}')">✕</span></span>`).join('');
+}
+
+function addKw(){
+  const v=id('kwIn').value.trim().toLowerCase();
+  if(!v){to('❌ Vide','e');return}
+  if(D.k.includes(v)){to('⚠️ Existe','w');return}
+  D.k.push(v);save();renderKW();id('kwIn').value='';to('✅ Ajouté','s')
+}
+
+function rmKw(k){D.k=D.k.filter(x=>x!==k);save();renderKW()}
+function resetKw(){D.k=getDefKws();save();renderKW();to('↩️ '+D.k.length+' mots-clés','s')}
+function clrKw(){if(!confirm('Tout effacer ?'))return;D.k=[];save();renderKW();to('🗑️ Vidé','w')}
+function expKw(){const b=new Blob([D.k.join('\n')],{type:'text/plain'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='kws_crogend.txt';a.click();URL.revokeObjectURL(u);to('📤 Exportés','s')}
+function impKw(){const i=document.createElement('input');i.type='file';i.accept='.txt';i.onchange=function(e){const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=function(ev){const lines=ev.target.result.split('\n').map(l=>l.trim().toLowerCase()).filter(l=>l);let a=0;lines.forEach(l=>{if(!D.k.includes(l)){D.k.push(l);a++}});if(a){save();renderKW()};to('📥 '+a+' importés','s')};r.readAsText(f)};i.click()}
+
+// ===== TARGETS =====
+function renderTG(){
+  const el=id('tgGrid');if(!el)return;
+  const c=id('tgCount');if(c)c.textContent=D.tg.length;
+  if(!D.tg.length){el.innerHTML='<div class="empty" style="grid-column:1/-1"><div class="ic">🎯</div><h3>Aucune cible</h3></div>';return}
+  const icons={personne:'👤',organisation:'🏢',site:'🌐'};
+  el.innerHTML=D.tg.map((t,i)=>`<div class="target-card" onclick="viewTg(${i})"><div class="ic">${icons[t.type]||'📌'}</div><div class="nm">${esc(t.name)}</div><div style="font-size:9px;color:var(--text3)">${t.type}${t.url?' · '+esc(t.url.substring(0,20)):''}</div></div>`).join('');
+}
+
+function addTg(){
+  const n=id('tgN').value.trim();const u=id('tgU').value.trim();const tp=id('tgT').value;
+  if(!n){to('❌ Nom requis','e');return}
+  D.tg.push({name:n,url:u,type:tp,date:new Date().toISOString()});
+  save();renderTG();id('tgN').value='';id('tgU').value='';to('🎯 Cible ajoutée','s')
+}
+
+function viewTg(i){const t=D.tg[i];if(t)alert('🎯 '+t.name+'\nType: '+t.type+(t.url?'\nURL: '+t.url:'')+'\nAjouté: '+new Date(t.date).toLocaleString('fr-FR'))}
+
+// ===== SOCIAL =====
+function renderSocial(){['fb','tw','tg','yt'].forEach(k=>{const el=id(k+'L');if(!el)return;const items=D[k]||[];if(!items.length){el.innerHTML='<div class="empty" style="padding:8px"><p style="font-size:10px">Aucun</p></div>';return}const icons={fb:'📘',tw:'🐦',tg:'✈️',yt:'▶️'};el.innerHTML=items.map(i=>`<div class="social-card"><div class="ic">${icons[k]||'🔗'}</div><div><div class="nm">${esc(i.name)}</div><div class="ur">${i.url.startsWith('http')?`<a href="${i.url}" target="_blank">${esc(i.url)}</a>`:esc(i.url)}</div></div></div>`).join('')})}
+function addFB(){const u=id('fbU').value.trim();const n=id('fbN').value.trim()||'Facebook';if(!u)return;D.fb.push({url:u,name:n});save();id('fbU').value='';id('fbN').value='';renderSocial();to('📘 Ajouté','s')}
+function addTW(){const u=id('twU').value.trim();const n=id('twN').value.trim()||'Twitter';if(!u)return;D.tw.push({url:u,name:n});save();id('twU').value='';id('twN').value='';renderSocial();to('🐦 Ajouté','s')}
+function addTG(){const u=id('tgU').value.trim();const n=id('tgN').value.trim()||'Telegram';if(!u)return;D.tg.push({url:u,name:n});save();id('tgU').value='';id('tgN').value='';renderSocial();to('✈️ Ajouté','s')}
+function addYT(){const u=id('ytU').value.trim();const n=id('ytN').value.trim()||'YouTube';if(!u)return;D.yt.push({url:u,name:n});save();id('ytU').value='';id('ytN').value='';renderSocial();to('▶️ Ajouté','s')}
+
+// ===== ALERTS =====
+function renderAl(){
+  const el=id('alList');if(!el)return;
+  const a=D.a||[];
+  if(!a.length){el.innerHTML='<div class="empty"><div class="ic">🔔</div><h3>Aucune alerte</h3></div>';return}
+  const c=id('bdAlert');const crit=a.filter(x=>x.s==='c').length;if(c){c.textContent=crit;c.className='badge danger'+(crit?'':'')}
+  el.innerHTML=a.slice(0,50).map(x=>`<div class="result-card"><div class="rc-src"><span class="sbadge ${x.s==='c'?'critical':'rss'}">${x.s==='c'?'🔴 CRIT':'🟠 ALERTE'}</span><span>${x.d?new Date(x.d).toLocaleString('fr-FR'):''}</span></div><div class="rc-title">${esc(x.m)}</div>${x.t?`<div class="rc-desc">${esc(x.t)}</div>`:''}</div>`).join('');
+}
+
+function addA(m,s,t){if(!D.a)D.a=[];D.a.unshift({m,s:t||'',t,'d':new Date().toISOString()});if(D.a.length>100)D.a=D.a.slice(0,100);save();up()}
+function clrAl(){if(!confirm('Effacer les alertes ?'))return;D.a=[];save();renderAl();to('🗑️ Vidé','w')}
+
+// ===== FAVORIS =====
+function renderFav(){
+  const el=id('favList');if(!el)return;
+  const f=D.p.map(i=>D.r[i]).filter(Boolean);
+  if(!f.length){el.innerHTML='<div class="empty"><div class="ic">⭐</div><h3>Aucun favori</h3></div>';return}
+  el.innerHTML=f.map(x=>`<div class="result-card" onclick="openD(${D.r.indexOf(x)})"><div class="rc-src"><span class="sbadge rss">⭐ Favori</span><span>📡 ${esc(x.source)}</span></div><div class="rc-title">${esc(x.title)}</div></div>`).join('');
+}
+function clrFav(){if(!confirm('Effacer favoris ?'))return;D.p=[];save();renderFav();to('🗑️ Vidé','w')}
+
+// ===== RECHERCHE =====
+async function searchW(){
+  const q=id('sq').value.trim();const l=id('sl').value;const c=id('sc').value.trim().toUpperCase()||'CI';
+  if(!q){to('❌ Recherche vide','e');return}
+  showL('🔍 Recherche...',null);
+  const u='https://news.google.com/rss/search?q='+encodeURIComponent(q)+'&hl='+l+'&gl='+c+'&ceid='+c+':'+l;
+  try{
+    const r=await fetchRSS(u);
+    const el=id('sRes');const ct=id('sCount');
+    if(r&&r.items&&r.items.length){
+      if(ct)ct.textContent=r.items.length+' résultats ('+r.proxy+')';
+      el.innerHTML=r.items.slice(0,30).map(item=>`<div class="result-card"><div class="rc-src"><span class="sbadge rss">📰 Google</span></div><div class="rc-title"><a href="${item.link||'#'}" target="_blank">${esc(item.title||'')}</a></div><div class="rc-desc">${esc((item.description||'').substring(0,250))}</div></div>`).join('')
+    }else{el.innerHTML='<div class="empty"><div class="ic">🔍</div><h3>Aucun résultat</h3></div>';if(ct)ct.textContent='0'}
+  }catch(e){id('sRes').innerHTML='<div class="empty"><div class="ic">❌</div><h3>Erreur réseau</h3></div>'}
+  hideL()
+}
+
+// ===== TRACKING =====
+function renderTrack(){
+  const kwC={};D.r.forEach(r=>{if(r.keywords)r.keywords.forEach(k=>{kwC[k]=(kwC[k]||0)+1})});
+  const topKW=Object.entries(kwC).sort((a,b)=>b[1]-a[1]).slice(0,20);
+  const t1=id('topKW');if(t1)t1.innerHTML=topKW.length?topKW.map(([k,c])=>`<div class="chart-bar"><span class="l">#${esc(k)}</span><div class="tr"><div class="f" style="width:${(c/Math.max(...topKW.map(x=>x[1])))*100}%;background:var(--orange)"></div></div><span class="va">${c}</span></div>`).join(''):'<div style="color:var(--text3);font-size:10px;padding:10px">Aucune donnée</div>';
+  
+  const srcC={};D.r.forEach(r=>{srcC[r.source]=(srcC[r.source]||0)+1});
+  const topSRC=Object.entries(srcC).sort((a,b)=>b[1]-a[1]).slice(0,20);
+  const t2=id('topSRC');if(t2)t2.innerHTML=topSRC.length?topSRC.map(([s,c])=>`<div class="chart-bar"><span class="l">📡 ${esc(s)}</span><div class="tr"><div class="f" style="width:${(c/Math.max(...topSRC.map(x=>x[1])))*100}%;background:#10b981"></div></div><span class="va">${c}</span></div>`).join(''):'<div style="color:var(--text3);font-size:10px;padding:10px">Aucune donnée</div>';
+  
+  // Activité 14 jours
+  const days={};D.r.forEach(r=>{if(r.date){try{const d=new Date(r.date).toLocaleDateString('fr-FR');days[d]=(days[d]||0)+1}catch(e){}}});
+  const sDays=Object.entries(days).sort((a,b)=>new Date(a[0])-new Date(b[0])).slice(-14);
+  const maxC=Math.max(...sDays.map(([_,c])=>c),1);
+  const act=id('actChart');
+  if(act)act.innerHTML=sDays.length?sDays.map(([d,c])=>`<div class="chart-bar"><span class="l" style="width:80px">${d}</span><div class="tr"><div class="f" style="width:${(c/maxC)*100}%;background:var(--grad)"></div></div><span class="va">${c}</span></div>`).join(''):'<div style="color:var(--text3);font-size:10px;padding:10px">Pas d\'activité</div>'
+}
+
+// ===== RAPPORT WORD =====
+function genReport(){
+  showL('📄 Rapport...',10);
+  const now=new Date();
+  const r=r24a(D.r);
+  const ci=r.filter(x=>x.sourceType==='ci');
+  const af=r.filter(x=>x.sourceType==='africa');
+  const wd=r.filter(x=>x.sourceType==='world');
+  const crit=r.filter(x=>x.severity==='critical');
+  
+  setTimeout(()=>{showL('📊 Analyse...',40)},300);
+  setTimeout(()=>{
+    showL('📝 Assemblage...',70);
+    let html=`<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
+    <head><meta charset="UTF-8"><style>
+      body{font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#1a1a1a;line-height:1.5;margin:40px}
+      h1{color:#f97316;font-size:22pt;border-bottom:3px solid #f97316;padding-bottom:8px}
+      h2{color:#1e3a5f;font-size:16pt;margin-top:24px;border-bottom:1px solid #ccc;padding-bottom:4px}
+      .header{text-align:center;margin-bottom:30px}
+      .header h1{font-size:26pt;border:none;color:#f97316}
+      .meta{background:#f5f5f5;padding:12px;border-radius:6px;margin:16px 0;font-size:10pt}
+      .item{border-left:3px solid #f97316;padding:8px 12px;margin:8px 0;background:#fafafa}
+      .item .t{font-weight:600;font-size:11pt}
+      .item .s{color:#666;font-size:9pt}
+      .critical{border-left-color:#ef4444;background:#fef2f2}
+      table{width:100%;border-collapse:collapse;margin:12px 0}
+      td,th{border:1px solid #ddd;padding:6px 10px;font-size:10pt}
+      th{background:#f97316;color:#fff}
+      .footer{text-align:center;color:#999;font-size:9pt;margin-top:40px;border-top:1px solid #ddd;padding-top:12px}
+    </style></head><body>
+    <div class="header">
+      <h1>🕵️ CROGEND — RAPPORT DE VEILLE 24H</h1>
+      <div style="color:#666">Cellule de Renseignement Opérationnel</div>
+      <p style="color:#666">${now.toLocaleDateString('fr-FR',{weekday:'long',year:'numeric',month:'long',day:'numeric'})} à ${now.toLocaleTimeString('fr-FR')}</p>
     </div>
-    <div style="font-size:8px;color:var(--tx2);margin-bottom:4px">${data.total} résultats</div>
-    <div id="fluxList">${(data.articles||[]).map(a=>`<div class="item ${a.level}" onclick="window.open('${a.url||''}','_blank')"><div class="item-title">${a.level==='critique'?'🔴':a.level==='haute'?'🟠':a.level==='moyenne'?'🟡':'🔵'} ${(a.title||'').substring(0,100)}</div><div class="item-meta"><span>${a.source}</span><span class="badge ${a.level}" style="font-size:7px">${a.level.toUpperCase()}</span><span>${a.cat}</span><span>${a.region}</span><span>${a.score}pts</span>${a.url?`<a href="${a.url}" target="_blank" style="color:var(--ac)">🔗</a>`:''}</div></div>`).join('')||'<div style="text-align:center;padding:20px;color:var(--tx2);font-size:10px">Aucun article</div>'}</div>`;
+    <div class="meta"><strong>📊 Synthèse :</strong> ${r.length} résultats · ${crit.length} alertes · ${D.s.length} sources · ${S.cycles} cycles</div>
+    <h2>📊 Statistiques</h2>
+    <table><tr><th>Métrique</th><th>Valeur</th></tr>
+      <tr><td>🇨🇮 Côte d'Ivoire</td><td>${ci.length}</td></tr>
+      <tr><td>🌍 Afrique</td><td>${af.length}</td></tr>
+      <tr><td>🌐 International</td><td>${wd.length}</td></tr>
+      <tr><td>🚨 Critiques</td><td>${crit.length}</td></tr>
+      <tr><td>📡 Sources</td><td>${D.s.length}</td></tr>
+      <tr><td>🔄 Cycles</td><td>${S.cycles}</td></tr>
+    </table>
+    <h2>🚨 ALERTES CRITIQUES</h2>
+    ${crit.length?crit.slice(0,10).map(x=>'<div class="item critical"><div class="t">'+esc(x.title)+'</div><div class="s">📡 '+esc(x.source)+' · '+(x.date?new Date(x.date).toLocaleString('fr-FR'):'')+'</div></div>').join(''):'<p>Aucune</p>'}
+    <h2>🇨🇮 CÔTE D'IVOIRE</h2>
+    ${ci.length?ci.slice(0,30).map(x=>'<div class="item"><div class="t">'+esc(x.title)+'</div><div class="s">📡 '+esc(x.source)+' · '+(x.date?new Date(x.date).toLocaleString('fr-FR'):'')+'</div>'+(x.link&&x.link!=='#'?'<div style="color:#3b82f6;font-size:9pt">🔗 '+x.link+'</div>':'')+'</div>').join(''):'<p>Aucune</p>'}
+    <h2>🌍 AFRIQUE</h2>
+    ${af.length?af.slice(0,20).map(x=>'<div class="item"><div class="t">'+esc(x.title)+'</div><div class="s">📡 '+esc(x.source)+'</div></div>').join(''):'<p>Aucune</p>'}
+    <h2>🌐 INTERNATIONAL</h2>
+    ${wd.length?wd.slice(0,20).map(x=>'<div class="item"><div class="t">'+esc(x.title)+'</div><div class="s">📡 '+esc(x.source)+'</div></div>').join(''):'<p>Aucune</p>'}
+    <div class="footer"><p>CROGEND OSINT v10 — ${now.toLocaleString('fr-FR')}</p><p><em>⚠️ Document confidentiel — usage interne</em></p></div>
+    </body></html>`;
+    
+    setTimeout(()=>{
+      const blob=new Blob([html],{type:'application/msword'});
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement('a');
+      a.href=url;
+      a.download='RAPPORT_CROGEND_'+now.toISOString().slice(0,10)+'.doc';
+      a.click();URL.revokeObjectURL(url);
+      hideL();
+      to('📄 Rapport généré','s');
+      log('📄 Rapport Word — '+r.length+' résultats');
+    },500);
+  },600);
 }
 
-async function loadAlertes(){
-  const data=await api('/api/alertes');
-  document.getElementById('content').innerHTML=`
-    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:8px">
-      <div><h2 style="font-size:15px">🚨 Alertes multi-sources</h2><p style="font-size:9px;color:var(--tx2)">Confirmées par ≥2 sources</p></div>
-      <button class="btn btn-outline btn-sm" onclick="apiPost('/api/alertes/read-all');loadAlertes()">✅ Tout marquer lu</button>
-    </div>
-    <div id="alertList">${(data.alertes||[]).map(a=>`<div class="alert-box ${a.niveau}" onclick="apiPost('/api/alerte/${a.id}/read');loadAlertes()"><div style="display:flex;justify-content:space-between"><div><b style="font-size:10px">${a.niveau==='critique'?'🔴':'🟠'} ${(a.title||'').substring(0,100)}</b><div style="font-size:8px;color:var(--tx2);margin-top:2px">📡 ${(a.sources||[]).join(', ')} · ${a.scount} sources</div></div><span style="font-size:10px;font-weight:700;color:var(--gd)">${a.score}pts</span></div><div style="font-size:8px;color:var(--tx2);margin-top:4px">${(a.descr||'').substring(0,120)}</div><div class="item-meta" style="margin-top:2px"><span>${a.cat}</span>${a.url?`<a href="${a.url}" target="_blank" style="color:var(--ac)">🔗 Source</a>`:''}</div></div>`).join('')||'<div style="text-align:center;padding:30px;color:var(--tx2);font-size:11px">✅ Aucune alerte</div>'}</div>`;
+function renderHist(){
+  const el=id('repHist');if(!el)return;
+  const reps=D.v||[];
+  if(!reps.length){el.innerHTML='<p style="font-size:10px;color:var(--text3)">Aucun rapport</p>';return}
+  el.innerHTML=reps.slice(0,10).map(r=>`<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border);font-size:10px"><span>📄 ${new Date(r.date).toLocaleString('fr-FR')}</span><span>${r.count} résultats</span></div>`).join('')
 }
 
-async function loadSources(){
-  const data=await api('/api/sources');
-  document.getElementById('content').innerHTML=`
-    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:8px">
-      <div><h2 style="font-size:15px">📰 Sources</h2><p style="font-size:9px;color:var(--tx2)">${data.sources.length} actives + ${data.custom.length} personnalisées</p></div>
-      <button class="btn btn-primary btn-sm" onclick="showAddSource()">➕ Ajouter</button>
-    </div>
-    <div style="margin-bottom:6px;font-size:10px;font-weight:600">📡 Personnalisées :</div>
-    ${data.custom.length?data.custom.map(s=>`<div class="card" style="padding:8px;margin-bottom:3px;display:flex;justify-content:space-between;align-items:center"><span><b style="font-size:10px">${s.name}</b> <span style="font-size:8px;color:var(--tx2)">${s.url.substring(0,40)}...</span></span><button class="btn btn-sm btn-danger" onclick="apiPost('/api/sources/delete/${s.name}',{}).then(loadSources)">✕</button></div>`).join(''):'<div style="font-size:9px;color:var(--tx2);padding:6px">Aucune source personnalisée</div>'}
-    <div style="margin:8px 0 6px;font-size:10px;font-weight:600">📡 Actives :</div>
-    ${data.sources.slice(0,80).map(s=>`<div class="card" style="padding:6px 8px;margin-bottom:2px"><div style="display:flex;justify-content:space-between;font-size:9px"><span><b>${s.source}</b> <span style="color:var(--tx2)">${s.region} · Niv.${s.slevel}</span></span><span>📄 ${s.ct} ${s.crit>0?`<span style="color:var(--rd)">🔴${s.crit}</span>`:''} ${s.haut>0?`<span style="color:var(--or)">🟠${s.haut}</span>`:''}</span></div></div>`).join('')}
-    <div style="text-align:center;padding:10px;font-size:9px;color:var(--tx2)">${data.sources.length>80?'... et '+(data.sources.length-80)+' autres':''}</div>`;
+// ===== EXPORT/IMPORT =====
+function expCfg(){
+  const cfg={sources:D.s,keywords:D.k,fb:D.fb,tw:D.tw,tg:D.tg,yt:D.yt,favorites:D.p,targets:D.tg,date:new Date().toISOString()};
+  const b=new Blob([JSON.stringify(cfg,null,2)],{type:'application/json'});
+  const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='config_crogend.json';a.click();URL.revokeObjectURL(u);to('💾 Exportée','s')
 }
 
-async function loadCategories(){
-  const data=await api('/api/categories');
-  document.getElementById('content').innerHTML=`
-    <h2 style="font-size:15px;margin-bottom:4px">📁 Catégories</h2>
-    <p style="font-size:9px;color:var(--tx2);margin-bottom:8px">Répartition thématique</p>
-    <div class="grid g3">${(data.categories||[]).map(c=>`<div class="card" style="text-align:center;padding:14px;cursor:pointer" onclick="document.getElementById('fCat')?document.getElementById('fCat').value='${c.cat}':null;showPage('flux')"><div style="font-size:22px;margin-bottom:4px">${c.cat==='Cyber'?'💻':c.cat==='Securite'?'🛡️':c.cat==='Politique'?'🏛️':c.cat==='Economie'?'📈':c.cat==='Diplomatie'?'🌍':c.cat==='Justice'?'⚖️':c.cat==='Societe'?'👥':'📋'}</div><div style="font-weight:600;font-size:11px">${c.cat}</div><div style="font-size:9px;color:var(--tx2)">${c.ct} articles</div>${c.crit>0?`<div style="font-size:8px;color:var(--rd)">🔴 ${c.crit} critiques</div>`:''}</div>`).join('')||'<div style="grid-column:1/-1;text-align:center;padding:20px;color:var(--tx2)">Aucune donnée</div>'}</div>`;
+function impCfg(){
+  const i=document.createElement('input');i.type='file';i.accept='.json';
+  i.onchange=function(e){
+    const f=e.target.files[0];if(!f)return;
+    const r=new FileReader();r.onload=function(ev){try{const c=JSON.parse(ev.target.result);if(c.sources)D.s=c.sources;if(c.keywords)D.k=c.keywords;if(c.fb)D.fb=c.fb;if(c.tw)D.tw=c.tw;if(c.tg)D.tg=c.tg;if(c.yt)D.yt=c.yt;if(c.favorites)D.p=c.favorites;if(c.targets)D.tg=c.tg;save();up();renderTG();renderFav();to('📥 Importée','s')}catch(e){to('❌ Fichier invalide','e')}};r.readAsText(f)
+  };i.click()
 }
 
-async function loadSettings(){
-  const s=state.stats.total?state.stats:await api('/api/stats');
-  document.getElementById('content').innerHTML=`
-    <h2 style="font-size:15px;margin-bottom:4px">⚙️ Paramètres</h2>
-    <p style="font-size:9px;color:var(--tx2);margin-bottom:8px">Tout est modifiable en temps réel</p>
-    <div class="grid g2">
-      <div class="card"><h3 style="font-size:11px;margin-bottom:8px">🎨 Thème</h3>
-        <div style="display:flex;gap:4px;flex-wrap:wrap">
-          ${['dark','clair','noir','bleu','vert','rouge','violet','or'].map(t=>`<button class="btn ${s.current_theme===t?'btn-primary':'btn-outline'} btn-sm" onclick="applyTheme('${t}')">${t}</button>`).join('')}
-        </div>
-      </div>
-      <div class="card"><h3 style="font-size:11px;margin-bottom:8px">⏱️ Scraping</h3>
-        <div class="floating-label"><input id="setInterval" placeholder=" " value="${s.interval||'180'}"><label>Intervalle (secondes)</label></div>
-        <div class="floating-label"><input id="setHours" placeholder=" " value="${s.hours||'24'}"><label>Profondeur (heures)</label></div>
-        <button class="btn btn-primary btn-sm mt-8" onclick="saveSettings()" style="margin-top:6px">💾 Sauvegarder</button>
-      </div>
-      <div class="card"><h3 style="font-size:11px;margin-bottom:8px">➕ Ajouter une source RSS</h3>
-        <div class="floating-label"><input id="srcName" placeholder=" "><label>Nom *</label></div>
-        <div class="floating-label"><input id="srcUrl" placeholder=" "><label>URL RSS *</label></div>
-        <div class="floating-label"><select id="srcReg" style="width:100%;background:var(--sf);border:1px solid var(--br);padding:10px 10px 4px;border-radius:6px;color:var(--tx);font-size:9px"><option value="nat">🔵 National</option><option value="cont">🟢 Continental</option><option value="inter">🔴 International</option></select></div>
-        <button class="btn btn-primary btn-sm mt-8" onclick="addSource()" style="margin-top:6px">✅ Ajouter</button>
-      </div>
-      <div class="card"><h3 style="font-size:11px;margin-bottom:8px">📊 Actions</h3>
-        <button class="btn btn-primary w-full" onclick="apiPost('/api/scan');toast('📡 Scan lancé')" style="width:100%;margin-bottom:4px">📡 Lancer un scan</button>
-        <button class="btn btn-outline w-full" onclick="apiPost('/api/alertes/read-all');toast('✅ Alertes marquées lues')" style="width:100%">✅ Tout marquer lu</button>
-      </div>
-    </div>`;
+// ===== NOTES =====
+function svNotes(){const ta=id('ntArea');if(ta&&ta.value)localStorage.setItem('cg_notes',ta.value);to('💾 Enregistré','s')}
+function expNotes(){const ta=id('ntArea');if(!ta||!ta.value.trim()){to('❌ Notes vides','e');return}const b=new Blob([ta.value],{type:'text/plain'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='notes_crogend_'+new Date().toISOString().slice(0,10)+'.txt';a.click();URL.revokeObjectURL(u);to('📤 Exportées','s')}
+
+// ===== SETTINGS =====
+function sv(k,v){
+  const map={intv:'cg_intv',cache:'cg_cache'};
+  localStorage.setItem(map[k]||k,v);
+  if(k==='intv'&&S.scan){clearInterval(S.timer);const iv=parseFloat(v)*60000;S.timer=setInterval(()=>{if(!S.busy&&S.scan)scan()},iv)}
+  to('✅ Sauvegardé','s')
 }
 
-async function loadHistorique(){
-  const data=await api('/api/historique');
-  document.getElementById('content').innerHTML=`
-    <h2 style="font-size:15px;margin-bottom:4px">📋 Historique</h2>
-    <p style="font-size:9px;color:var(--tx2);margin-bottom:8px">Évolution des statistiques</p>
-    ${(data.historique||[]).length?data.historique.map(h=>`<div class="card" style="padding:8px;margin-bottom:3px"><div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px;font-size:9px"><span>🕐 ${h.ts}</span><span>📄 ${h.total}</span><span style="color:var(--rd)">🔴 ${h.crit}</span><span style="color:var(--or)">🟠 ${h.haut}</span><span>📡 ${h.src}</span><span style="color:var(--gd)">🚨 ${h.alrt}</span></div></div>`).join(''):'<div style="text-align:center;padding:20px;color:var(--tx2)">Aucun historique</div>'}`;
+function nuke(){
+  if(!confirm('⚠️⚠️ TOUT EFFACER ?'))return;
+  if(!confirm('⚠️⚠️ CONFIRMATION FINALE ?'))return;
+  Object.values(SK).forEach(k=>localStorage.removeItem(k));
+  ['cg_notes','cg_intv','cg_cache'].forEach(k=>localStorage.removeItem(k));
+  Object.keys(D).forEach(k=>{if(Array.isArray(D[k]))D[k]=[]});
+  D.k=getDefKws();
+  D.s=Object.values(PRESETS).flat().slice(0,10).map(s=>({n:s.n,u:s.u,t:'rss'}));
+  if(S.timer){clearInterval(S.timer);S.timer=null}
+  S.scan=false;S.cycles=0;S.total=0;S.busy=false;S.last=null;S.lastN=0;S.dur=0;S.ok=0;
+  save();up();renderTG();renderFav();log('🗑️ Tout effacé');to('🗑️ Réinitialisé','w')
 }
 
-function debounce(fn,ms){let t;return(...args)=>{clearTimeout(t);t=setTimeout(()=>fn(...args),ms)}}
-
-async function saveSettings(){
-  const iv=document.getElementById('setInterval')?.value;
-  const hr=document.getElementById('setHours')?.value;
-  await apiPost('/api/settings',{interval:iv,hours:hr});
-  toast('✅ Paramètres sauvegardés');
-}
-
-async function addSource(){
-  const n=document.getElementById('srcName')?.value.trim();
-  const u=document.getElementById('srcUrl')?.value.trim();
-  const r=document.getElementById('srcReg')?.value||'nat';
-  if(!n||!u) return toast('❌ Nom et URL requis');
-  await apiPost('/api/sources/add',{name:n,url:u,region:r,level:70});
-  toast('✅ Source ajoutée: '+n);
-  loadSettings();
-}
-
-async function applyTheme(t){
-  await apiPost('/api/settings',{theme:t});
-  document.body.className='theme-'+t;
-  toast('🎨 Thème: '+t);
-  loadSettings();
-}
-
-function connectSSE(){
-  const src=new EventSource('/stream');
-  src.onmessage=function(e){
-    try{const ev=JSON.parse(e.data);if(ev.type==='stats'||ev.type==='scan_done'){loadDashboard();}}catch(err){}
-  };
-  src.onerror=function(){setTimeout(connectSSE,5000)};
-}
-
-// Init theme
-api('/api/stats').then(s=>{
-  if(s.current_theme){document.body.className='theme-'+s.current_theme}
-  state.stats=s;
+// ===== INIT =====
+document.addEventListener('DOMContentLoaded',function(){
+  console.log('🕵️ CROGEND v10 PRO');
+  load();
+  if(!D.s.length){D.s=Object.values(PRESETS).flat().slice(0,15).map(s=>({n:s.n,u:s.u,t:'rss'}));save()}
+  const nv=localStorage.getItem('cg_notes');const ta=id('ntArea');if(ta&&nv)ta.value=nv;
+  const iv=localStorage.getItem('cg_intv');if(iv){const e=id('scanIntv');if(e)e.value=iv;const e2=id('setIntv');if(e2)e2.value=iv}
+  const ca=localStorage.getItem('cg_cache');if(ca){const e=id('scanCache');if(e)e.value=ca;const e2=id('setCache');if(e2)e2.value=ca}
+  renderSocial();renderTG();renderFav();up();
+  log('🕵️ CROGEND v10 PRO initialisé');
+  log('📡 '+D.s.length+' sources · '+D.k.length+' mots-clés');
+  log('🇨🇮 Focus Côte d\'Ivoire');
+  
+  setInterval(()=>{const ta=id('ntArea');if(ta&&ta.value)localStorage.setItem('cg_notes',ta.value)},30000);
+  
+  if(D.r.length<50&&D.s.length){setTimeout(()=>{if(!S.busy)scan()},3000)}
+  
+  setTimeout(()=>to('🕵️ CROGEND prêt · '+r24a(D.r).length+' résultats','i',4000),800);
 });
 
-document.addEventListener('DOMContentLoaded',init);
-</script></body></html>
-"""
-
-# ═══════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════
-
-if __name__=="__main__":
-    print("\n"+"="*50)
-    print("  ⟡ NEXUS DIAMOND v5 — FONCTIONNEL IMMÉDIAT")
-    print("="*50)
-    print(f"  📡 {len(RSS)} sources RSS + personnalisables")
-    print(f"  🔑 {len(ALL_KW)} mots-clés")
-    print(f"  🌐 http://0.0.0.0:5000")
-    print("  ⏎ Ctrl+C pour arrêter\n")
-    
-    Scraper().start()
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
-NEXUSFINAL
-
-# COLLE CE SCRIPT DANS UN FICHIER ET LANCE
-cat > nexus.py << 'NEXUSFINAL'
-#!/usr/bin/env python3
-"""NEXUS DIAMOND v5 — Fonctionnel immédiat. Tout modifiable depuis l'interface."""
-
-import os, sys, json, time, hashlib, re, html, threading, queue, sqlite3
-from datetime import datetime, timezone, timedelta
-from collections import Counter
-from urllib.parse import urlparse
-
-# Auto-install
-for pkg, imp in [("flask","flask"),("feedparser","feedparser"),("bs4","bs4"),("requests","requests")]:
-    try:
-        __import__(imp)
-    except:
-        os.system(f"{sys.executable} -m pip install {pkg} --quiet")
-        __import__(imp)
-
-from flask import Flask, Response, request, jsonify, render_template_string
-import feedparser
-from bs4 import BeautifulSoup
-import requests
-
-# DB
-conn = sqlite3.connect("nexus.db", check_same_thread=False)
-conn.row_factory = sqlite3.Row
-conn.execute("PRAGMA journal_mode=WAL")
-conn.executescript("""
-CREATE TABLE IF NOT EXISTS articles(id TEXT PRIMARY KEY, title TEXT, url TEXT, descr TEXT, source TEXT, slevel INT DEFAULT 70, region TEXT DEFAULT 'inter', level TEXT DEFAULT 'info', score INT DEFAULT 0, cat TEXT DEFAULT 'General', pub TEXT, col TEXT DEFAULT (datetime('now')), img TEXT, lu INT DEFAULT 0);
-CREATE TABLE IF NOT EXISTS alertes(id TEXT PRIMARY KEY, title TEXT, descr TEXT, niveau TEXT DEFAULT 'haute', score INT DEFAULT 0, cat TEXT DEFAULT 'General', sources TEXT, scount INT DEFAULT 1, url TEXT, created TEXT DEFAULT (datetime('now')), lu INT DEFAULT 0);
-CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, val TEXT);
-CREATE TABLE IF NOT EXISTS custom_sources(name TEXT, url TEXT, region TEXT, level INT);
-CREATE TABLE IF NOT EXISTS stats(id INTEGER PRIMARY KEY AUTOINCREMENT, total INT, crit INT, haut INT, moy INT, src INT, alrt INT, ts TEXT DEFAULT (datetime('now')));
-INSERT OR IGNORE INTO settings VALUES('theme','dark'),('interval','180'),('hours','24'),('max_articles','50000'),('extract_images','1');
-""")
-conn.commit()
-
-KW_CRIT = ["meurtre","assassinat","massacre","attentat","explosion","attaque","fusillade","coup d'etat","putsch","insurrection","guerre","conflit arme","terrorisme","epidemie","pandemie","ebola","inondation","seisme","accident mortel","naufrage","crash","incendie","drogue","cocaine","arme de guerre","enlevement","viol","execution","etat d'urgence","couvre-feu","cyberattaque","brèche","anonymous","hacktivisme"]
-KW_HAUT = ["securite","armee","police","gendarmerie","presidence","president","ministre","gouvernement","corruption","detournement","scandale","cybercriminalite","piratage","election","vote","crise politique","diplomatie","defense","renseignement","manifestation","greve","sanction","embargo","droits humains","anonymous","data leak","fuite","ddos","ransomware","hack"]
-KW_MOY = ["sante","hopital","education","ecole","universite","economie","investissement","agriculture","culture","sport","technologie","environnement","nomination","reforme","loi","decret","accident","religion"]
-ALL_KW = list(set(KW_CRIT + KW_HAUT + KW_MOY))
-
-RSS = [
-    ("Fraternité Matin","https://www.fratmat.info/rss","nat",100),("RTI","https://www.rti.ci/rss","nat",100),("Abidjan.net","https://news.abidjan.net/rss","nat",100),("AIP","https://www.aip.ci/feed/","nat",100),("7Info","https://7info.ci/rss","nat",95),("Soir Info","https://www.soirinfo.com/rss","nat",95),("L'Inter","https://www.linterci.com/rss","nat",95),("Koaci","https://www.koaci.com/rss","nat",95),("Linfodrome","https://www.linfodrome.com/24h?format=feed","nat",95),("Connection Ivoirienne","https://www.connectionivoirienne.net/feed/","nat",90),("Jeune Afrique","https://www.jeuneafrique.com/feed/","cont",100),("RFI Afrique","https://www.rfi.fr/fr/afrique/rss","cont",100),("BBC Afrique","https://www.bbc.com/afrique/rss.xml","cont",100),("Le Monde Afrique","https://www.lemonde.fr/afrique/rss_full.xml","cont",100),("AfricaNews","https://www.africanews.com/feed/","cont",95),("France24 Afrique","https://www.france24.com/fr/afrique/rss","cont",95),("Al Jazeera","https://www.aljazeera.com/xml/rss/all.xml","cont",95),("Crisis Group","https://www.crisisgroup.org/rss.xml","inter",95),("HRW","https://www.hrw.org/rss/africa","cont",95),("ISS Africa","https://issafrica.org/rss.xml","cont",95),("ONU Info","https://news.un.org/feed/subscribe/en/news/region/africa/feed/rss.xml","cont",100),("Interpol","https://www.interpol.int/rss","inter",100),("Krebs","https://krebsonsecurity.com/feed/","inter",90),("The Hacker News","https://feeds.feedburner.com/TheHackersNews","inter",85),("Bleeping Computer","https://www.bleepingcomputer.com/feed/","inter",85),("Cisco Talos","https://blog.talosintelligence.com/feed/","inter",90),("CrowdStrike","https://www.crowdstrike.com/blog/feed/","inter",85),("Anonymous News","https://www.anonymous.news/feed/","inter",80),("HackRead","https://www.hackread.com/feed/","inter",80),("Security Affairs","https://securityaffairs.com/feed","inter",80),("Schneier","https://www.schneier.com/feed/","inter",85),("Troy Hunt","https://www.troyhunt.com/rss/","inter",85),("AnonHQ","https://anonhq.com/feed/","inter",75),("GNews CI","https://news.google.com/rss/search?q=C%C3%B4te+d%27Ivoire+apr%C3%A8s+2025&hl=fr&gl=CI&ceid=CI:fr","nat",95),("GNews Securite","https://news.google.com/rss/search?q=s%C3%A9curit%C3%A9+attaque+C%C3%B4te+d%27Ivoire&hl=fr&gl=CI&ceid=CI:fr","nat",95),("GNews Cyber","https://news.google.com/rss/search?q=cybercriminalit%C3%A9+Afrique+hacking&hl=fr&gl=CI&ceid=CI:fr","cont",90),("GNews Terrorisme","https://news.google.com/rss/search?q=terrorisme+Sahel+Afrique+attentat&hl=fr&gl=CI&ceid=CI:fr","cont",95),("GNews Conflits","https://news.google.com/rss/search?q=conflit+guerre+Afrique+monde&hl=fr&gl=CI&ceid=CI:fr","inter",90),
-]
-
-session = requests.Session()
-session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-sse_queue = queue.Queue()
-
-def nml(t):
-    if not t: return ""
-    t = t.lower()
-    for a,b in [('é','e'),('è','e'),('ê','e'),('ë','e'),('à','a'),('â','a'),('ä','a'),('ù','u'),('û','u'),('ü','u'),('ô','o'),('ö','o'),('î','i'),('ï','i'),('ç','c')]:
-        t = t.replace(a,b)
-    return t
-
-def detect_lv(t,d=""):
-    txt = nml(f"{t} {d[:200]}")
-    for k in KW_CRIT:
-        if k in txt: return "critique", [k]
-    for k in KW_HAUT:
-        if k in txt: return "haute", [k]
-    for k in KW_MOY:
-        if k in txt: return "moyenne", [k]
-    return "info", []
-
-def calc_score(t,d,sl,lv):
-    s = sl
-    txt = nml(f"{t} {d[:200]}")
-    if lv=="critique": s+=50
-    elif lv=="haute": s+=30
-    elif lv=="moyenne": s+=15
-    for k in ALL_KW:
-        if k in txt: s+=2
-    return min(s,200)
-
-def detect_cat(t,d):
-    txt = nml(f"{t} {d[:200]}")
-    cats = {"Politique":["gouvernement","president","ministre","election","vote","parti","loi","reforme"],"Securite":["armee","police","gendarmerie","securite","defense","terrorisme","attaque","criminalite"],"Cyber":["cyberattaque","piratage","hack","ransomware","virus","malware","breche","faille","anonymous","ddos"],"Economie":["economie","finance","banque","marche","investissement","pib","inflation","bceao","brvm"],"Diplomatie":["diplomatie","ambassade","onu","ua","cedeao","cooperation","sommet"],"Societe":["societe","education","sante","culture","religion","jeunesse"],"Justice":["justice","tribunal","proces","mandat","enquete","juge","prison"]}
-    for c,m in cats.items():
-        if any(k in txt for k in m): return c
-    return "General"
-
-def detect_reg(t,d,sr,sn=""):
-    txt = nml(f"{t} {d[:100]}")
-    ci = ["cote d'ivoire","abidjan","ivoirien","yopougon","cocody","bouake","gbagbo","ouattara","bedie","soro"]
-    af = ["afrique","mali","burkina","niger","guinee","senegal","ghana","nigeria","cameroun","rdc","sahel"]
-    for k in ci:
-        if k in txt: return "nat"
-    for k in af:
-        if k in txt: return "cont"
-    return sr
-
-def get_set(k, defv=""):
-    r = conn.execute("SELECT val FROM settings WHERE key=?",(k,)).fetchone()
-    return r["val"] if r else defv
-
-def set_set(k,v):
-    conn.execute("INSERT OR REPLACE INTO settings VALUES(?,?)",(k,v))
-    conn.commit()
-
-def scrape():
-    arts = []
-    sources = RSS
-    cs = conn.execute("SELECT * FROM custom_sources").fetchall()
-    for s in cs:
-        sources.append((s["name"],s["url"],s["region"] or "nat",s["level"] or 70))
-    hours = int(get_set("hours","24"))
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    for name,url,region,level in sources:
-        try:
-            time.sleep(0.03)
-            r = session.get(url, timeout=10)
-            if r.status_code!=200: continue
-            feed = feedparser.parse(r.content)
-            for e in feed.entries[:20]:
-                t = (e.get("title","") or "").strip()
-                l = (e.get("link","") or "").strip()
-                if not t or not l: continue
-                d = BeautifulSoup(e.get("summary","") or e.get("description","") or "","html.parser").get_text()[:400]
-                pub = datetime.now(timezone.utc)
-                if e.get("published_parsed"):
-                    try: pub = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
-                    except: pass
-                if pub < cutoff: continue
-                txt = nml(f"{t} {d}")
-                matched = [k for k in ALL_KW if k in txt]
-                if not matched: continue
-                uid = hashlib.sha256(f"{name}:{l}".encode()).hexdigest()[:16]
-                lv,kw = detect_lv(t,d)
-                reg = detect_reg(t,d,region,name)
-                cat = detect_cat(t,d)
-                sc = calc_score(t,d,level,lv)
-                arts.append({"id":uid,"title":t[:300],"url":l,"descr":d[:400],"source":name,"slevel":level,"region":reg,"level":lv,"score":sc,"cat":cat,"pub":pub.isoformat(),"img":""})
-        except: pass
-    return arts
-
-def save(arts):
-    saved=0
-    for a in arts:
-        try:
-            conn.execute("INSERT OR IGNORE INTO articles VALUES(?,?,?,?,?,?,?,?,?,?,?,datetime('now'),?,0)",(a["id"],a["title"],a["url"],a["descr"],a["source"],a["slevel"],a["region"],a["level"],a["score"],a["cat"],a["pub"],a["img"]))
-            if conn.total_changes: saved+=1
-        except: pass
-    conn.commit()
-    return saved
-
-def detect_alert():
-    hours = int(get_set("hours","24"))
-    cutoff = (datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
-    rows = conn.execute("SELECT * FROM articles WHERE level IN ('critique','haute') AND col > ? ORDER BY score DESC",(cutoff,)).fetchall()
-    groups = {}
-    for r in rows:
-        words = set(nml(r["title"]).split())
-        sw = sorted([w for w in words if len(w)>=4])[:5]
-        if not sw: continue
-        key = "_".join(sw)
-        if key not in groups: groups[key]=[]
-        groups[key].append(r)
-    nv=0
-    for k,items in groups.items():
-        if len(items)<2: continue
-        sources = list(set(i["source"] for i in items))
-        if len(sources)<2: continue
-        best = max(items, key=lambda x:x["score"])
-        aid = hashlib.sha256(f"al:{k}".encode()).hexdigest()[:16]
-        if conn.execute("SELECT id FROM alertes WHERE id=?",(aid,)).fetchone(): continue
-        nv_ = "critique" if any(i["level"]=="critique" for i in items) else "haute"
-        conn.execute("INSERT OR IGNORE INTO alertes VALUES(?,?,?,?,?,?,?,?,?,datetime('now'),0)",(aid,best["title"][:200],best["descr"][:300],nv_,best["score"]+len(sources)*10,best["cat"],json.dumps(sources),len(sources),best["url"]))
-        if conn.total_changes: nv+=1
-    conn.commit()
-    return nv
-
-def update_stats():
-    hours = int(get_set("hours","24"))
-    cutoff = (datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
-    t = conn.execute("SELECT COUNT(*) FROM articles WHERE col>?",(cutoff,)).fetchone()[0]
-    c = conn.execute("SELECT COUNT(*) FROM articles WHERE level='critique' AND col>?",(cutoff,)).fetchone()[0]
-    h = conn.execute("SELECT COUNT(*) FROM articles WHERE level='haute' AND col>?",(cutoff,)).fetchone()[0]
-    m = conn.execute("SELECT COUNT(*) FROM articles WHERE level='moyenne' AND col>?",(cutoff,)).fetchone()[0]
-    s = conn.execute("SELECT COUNT(DISTINCT source) FROM articles WHERE col>?",(cutoff,)).fetchone()[0]
-    a = conn.execute("SELECT COUNT(*) FROM alertes WHERE created>?",(cutoff,)).fetchone()[0]
-    conn.execute("INSERT INTO stats(total,crit,haut,moy,src,alrt) VALUES(?,?,?,?,?,?)",(t,c,h,m,s,a))
-    conn.commit()
-    return {"total":t,"critiques":c,"hautes":h,"moyennes":m,"sources":s,"alertes":a}
-
-class Scraper(threading.Thread):
-    def run(self):
-        while True:
-            start=time.time()
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Scraping {len(RSS)} sources...")
-            arts=scrape()
-            s=save(arts)
-            a=detect_alert()
-            st=update_stats()
-            print(f"  +{s} articles | {a} alertes | {st['total']} total")
-            if s>0: sse_queue.put({"type":"new_articles","data":{"count":s,"stats":st}})
-            if a>0: sse_queue.put({"type":"new_alertes","data":{"count":a}})
-            sse_queue.put({"type":"stats","data":st})
-            slp=max(1,int(get_set("interval","180"))-(time.time()-start))
-            time.sleep(slp)
-
-app = Flask(__name__)
-
-@app.route("/api/stats")
-def api_stats():
-    st=update_stats()
-    anl=conn.execute("SELECT COUNT(*) FROM alertes WHERE lu=0").fetchone()[0]
-    st["alertes_non_lues"]=anl
-    st["themes"]=["dark","clair","noir","bleu","vert","rouge","violet","or"]
-    st["current_theme"]=get_set("theme","dark")
-    st["interval"]=get_set("interval","180")
-    st["hours"]=get_set("hours","24")
-    return jsonify(st)
-
-@app.route("/api/articles")
-def api_articles():
-    lim=min(int(request.args.get("limit",50)),500)
-    off=int(request.args.get("offset",0))
-    lv=request.args.get("level","all")
-    reg=request.args.get("region","all")
-    cat=request.args.get("category","all")
-    src=request.args.get("source","all")
-    q=request.args.get("search","").strip()
-    sort=request.args.get("sort","score")
-    hours=int(get_set("hours","24"))
-    cutoff=(datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
-    query="SELECT * FROM articles WHERE col>?"
-    params=[cutoff]
-    if lv!="all": query+=" AND level=?"; params.append(lv)
-    if reg!="all": query+=" AND region=?"; params.append(reg)
-    if cat!="all": query+=" AND cat=?"; params.append(cat)
-    if src!="all": query+=" AND source=?"; params.append(src)
-    if q: query+=" AND (title LIKE ? OR descr LIKE ?)"; params.extend([f"%{q}%",f"%{q}%"])
-    total=conn.execute(query.replace("SELECT *","SELECT COUNT(*)"),params).fetchone()[0]
-    query+=f" ORDER BY {'pub' if sort=='date' else 'score'} DESC LIMIT ? OFFSET ?"
-    params.extend([lim,off])
-    rows=conn.execute(query,params).fetchall()
-    return jsonify({"articles":[dict(r) for r in rows],"total":total})
-
-@app.route("/api/alertes")
-def api_alertes():
-    hours=int(get_set("hours","24"))
-    cutoff=(datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
-    rows=conn.execute("SELECT * FROM alertes WHERE created>? ORDER BY score DESC LIMIT 100",(cutoff,)).fetchall()
-    al=[]
-    for r in rows:
-        a=dict(r)
-        a["sources"]=json.loads(a["sources"]) if a["sources"] else []
-        al.append(a)
-    return jsonify({"alertes":al})
-
-@app.route("/api/sources")
-def api_sources():
-    hours=int(get_set("hours","24"))
-    cutoff=(datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
-    rows=conn.execute("""SELECT source,slevel,region,COUNT(*) as ct,SUM(CASE WHEN level='critique' THEN 1 ELSE 0 END) as crit,SUM(CASE WHEN level='haute' THEN 1 ELSE 0 END) as haut FROM articles WHERE col>? GROUP BY source ORDER BY ct DESC""",(cutoff,)).fetchall()
-    cs=conn.execute("SELECT * FROM custom_sources").fetchall()
-    return jsonify({"sources":[dict(r) for r in rows],"custom":[dict(c) for c in cs]})
-
-@app.route("/api/categories")
-def api_categories():
-    hours=int(get_set("hours","24"))
-    cutoff=(datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
-    rows=conn.execute("SELECT cat,COUNT(*) as ct,SUM(CASE WHEN level='critique' THEN 1 ELSE 0 END) as crit FROM articles WHERE col>? GROUP BY cat ORDER BY ct DESC",(cutoff,)).fetchall()
-    return jsonify({"categories":[dict(r) for r in rows]})
-
-@app.route("/api/historique")
-def api_historique():
-    rows=conn.execute("SELECT * FROM stats ORDER BY ts DESC LIMIT 50").fetchall()
-    return jsonify({"historique":[dict(r) for r in rows]})
-
-@app.route("/api/settings",methods=["GET","POST"])
-def api_settings():
-    if request.method=="POST":
-        d=request.json
-        for k,v in d.items():
-            set_set(k,str(v))
-        return jsonify({"success":True})
-    return jsonify({k:get_set(k) for k in ["theme","interval","hours","max_articles","extract_images"]})
-
-@app.route("/api/sources/add",methods=["POST"])
-def api_add_source():
-    d=request.json
-    conn.execute("INSERT INTO custom_sources VALUES(?,?,?,?)",(d["name"],d["url"],d.get("region","nat"),int(d.get("level",70))))
-    conn.commit()
-    return jsonify({"success":True})
-
-@app.route("/api/sources/delete/<name>",methods=["DELETE"])
-def api_del_source(name):
-    conn.execute("DELETE FROM custom_sources WHERE name=?",(name,))
-    conn.commit()
-    return jsonify({"success":True})
-
-@app.route("/api/alertes/read-all",methods=["POST"])
-def api_alertes_read():
-    conn.execute("UPDATE alertes SET lu=1")
-    conn.commit()
-    return jsonify({"success":True})
-
-@app.route("/api/alerte/<id>/read",methods=["POST"])
-def api_alerte_read(id):
-    conn.execute("UPDATE alertes SET lu=1 WHERE id=?",(id,))
-    conn.commit()
-    return jsonify({"success":True})
-
-@app.route("/api/scan",methods=["POST"])
-def api_scan():
-    threading.Thread(target=lambda:(save(scrape()),detect_alert(),update_stats(),sse_queue.put({"type":"scan_done"})),daemon=True).start()
-    return jsonify({"success":True})
-
-@app.route("/api/logs")
-def api_logs():
-    hours=int(get_set("hours","24"))
-    cutoff=(datetime.now(timezone.utc)-timedelta(hours=hours)).isoformat()
-    rows=conn.execute("SELECT strftime('%H:%M',ts) as time,total,crit,haut FROM stats ORDER BY ts DESC LIMIT 24").fetchall()
-    return jsonify({"logs":[dict(r) for r in reversed(rows)]})
-
-@app.route("/stream")
-def stream():
-    def gen():
-        while True:
-            try:
-                e=sse_queue.get(timeout=30)
-                yield f"data: {json.dumps(e,ensure_ascii=False)}\n\n"
-            except queue.Empty:
-                yield ": keepalive\n\n"
-    return Response(gen(),mimetype="text/event-stream",headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-
-@app.route("/")
-def index():
-    return render_template_string(HTML)
-
-# ═══════════════════════════════════════════
-# FRONTEND HTML COMPLET
-# ═══════════════════════════════════════════
-
-HTML = r"""<!DOCTYPE html><html lang="fr"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>⟡ NEXUS DIAMOND v5</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box;font-family:system-ui,-apple-system,sans-serif;transition:background .2s,color .2s}
-:root{--bg:#060810;--sf:#0c0f1c;--cd:#121828;--cd2:#181f38;--tx:#eef2fa;--tx2:#8898c8;--ac:#00e5ff;--ac2:#ff6b35;--gr:#00ff88;--rd:#ff0030;--or:#ff6b00;--ye:#ffcc00;--pu:#aa66ff;--gd:#ffd700;--br:#1e2a4a;--r:12px}
-.theme-clair{--bg:#f0f2f8;--sf:#e4e7f0;--cd:#fff;--cd2:#f4f6fc;--tx:#1a1d2e;--tx2:#5a6a8a;--br:#d0d6e4}
-.theme-noir{--bg:#000;--sf:#0a0a0a;--cd:#111;--cd2:#1a1a1a;--tx:#fff;--tx2:#888;--br:#222}
-.theme-bleu{--bg:#0a1628;--sf:#0f1f3a;--cd:#142850;--cd2:#1a3366;--tx:#e0eeff;--tx2:#7a9ec8;--br:#1e4a7a}
-.theme-vert{--bg:#0a1a0a;--sf:#0f2a0f;--cd:#143a14;--cd2:#1a4a1a;--tx:#e0ffe0;--tx2:#7ac87a;--br:#1e4a1e}
-.theme-rouge{--bg:#1a0a0a;--sf:#2a0f0f;--cd:#3a1414;--cd2:#4a1a1a;--tx:#ffe0e0;--tx2:#c87a7a;--br:#4a1e1e}
-.theme-violet{--bg:#100a1a;--sf:#1a0f2a;--cd:#24143a;--cd2:#2e1a4a;--tx:#eee0ff;--tx2:#9a7ac8;--br:#3a1e5a}
-.theme-or{--bg:#1a180a;--sf:#2a2610;--cd:#3a3416;--cd2:#4a421c;--tx:#fffae0;--tx2:#c8b87a;--br:#5a4e1e}
-body{background:var(--bg);color:var(--tx);min-height:100vh}
-.nav{position:fixed;top:0;left:0;right:0;height:48px;background:rgba(8,11,22,.97);border-bottom:1px solid var(--br);display:flex;align-items:center;padding:0 12px;z-index:1000;gap:8px}
-.nav-logo{font-size:15px;font-weight:800;background:linear-gradient(135deg,#00e5ff,#aa66ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;white-space:nowrap}
-.nav-logo span{display:inline-block;width:28px;height:28px;line-height:28px;text-align:center;background:linear-gradient(135deg,#00e5ff,#aa66ff);border-radius:6px;color:#fff;font-size:12px;-webkit-text-fill-color:#fff;margin-right:4px}
-.nav-items{display:flex;gap:2px;overflow-x:auto;flex:1;scrollbar-width:none}
-.nav-items::-webkit-scrollbar{display:none}
-.nav-items button{padding:5px 10px;border-radius:6px;border:none;background:transparent;color:var(--tx2);font-size:10px;cursor:pointer;white-space:nowrap;font-weight:500}
-.nav-items button:hover{color:var(--tx);background:var(--cd)}
-.nav-items button.active{color:var(--ac);background:var(--cd)}
-.nav-info{display:flex;align-items:center;gap:6px;font-size:9px;color:var(--tx2);flex-shrink:0}
-.nav-info .dot{width:6px;height:6px;border-radius:50%;background:var(--gr);animation:pulse 1.5s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.content{padding:60px 12px 12px;max-width:1400px;margin:0 auto}
-.page{display:none}.page.active{display:block;animation:fade .15s}
-@keyframes fade{from{opacity:0}to{opacity:1}}
-.grid{display:grid;gap:6px}.g2{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}.g3{grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}.g4{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
-.card{background:var(--cd);border:1px solid var(--br);border-radius:var(--r);padding:12px}
-.card:hover{border-color:var(--ac);transform:translateY(-1px);box-shadow:0 4px 20px rgba(0,0,0,.4)}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:6px;margin-bottom:8px}
-.stat-card{background:var(--cd);border:1px solid var(--br);border-radius:10px;padding:10px 6px;text-align:center}
-.stat-card .num{font-size:20px;font-weight:800;color:var(--ac)}
-.stat-card .label{font-size:8px;color:var(--tx2);text-transform:uppercase;margin-top:1px}
-.badge{display:inline-flex;padding:1px 8px;border-radius:12px;font-size:8px;font-weight:700}
-.badge.critique{background:var(--rd);color:#fff}.badge.haute{background:var(--or);color:#fff}.badge.moyenne{background:var(--ye);color:#000}.badge.info{background:var(--ac);color:#000}
-.item{padding:6px 8px;background:var(--cd2);border-radius:6px;margin-bottom:3px;border-left:3px solid var(--ac);cursor:pointer}
-.item:hover{background:var(--cd)}
-.item.critique{border-left-color:var(--rd)}.item.haute{border-left-color:var(--or)}.item.moyenne{border-left-color:var(--ye)}
-.item-title{font-size:10px;font-weight:600;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
-.item-meta{font-size:8px;color:var(--tx2);margin-top:1px;display:flex;gap:4px;flex-wrap:wrap}
-.alert-box{padding:8px 12px;background:rgba(255,0,48,.08);border:1px solid var(--rd);border-radius:8px;margin-bottom:4px;cursor:pointer}
-.alert-box:hover{background:rgba(255,0,48,.12)}
-.alert-box.haute{background:rgba(255,107,0,.08);border-color:var(--or)}
-.alert-box.haute:hover{background:rgba(255,107,0,.12)}
-.tabs{display:flex;gap:2px;margin-bottom:8px;overflow-x:auto;scrollbar-width:none;border-bottom:1px solid var(--br)}
-.tabs button{padding:5px 12px;border:none;background:transparent;color:var(--tx2);font-size:9px;cursor:pointer;white-space:nowrap}
-.tabs button:hover{color:var(--tx)}
-.tabs button.active{background:var(--cd);color:var(--ac);border-radius:6px 6px 0 0}
-.search-bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px;padding:8px 12px;background:var(--cd);border-radius:var(--r);border:1px solid var(--br)}
-.search-bar input,.search-bar select{flex:1;min-width:80px;background:var(--sf);border:1px solid var(--br);padding:5px 8px;border-radius:6px;color:var(--tx);font-size:9px}
-.search-bar input:focus,.search-bar select:focus{border-color:var(--ac);outline:none}
-.btn{padding:5px 12px;border-radius:6px;border:none;font-size:9px;font-weight:600;cursor:pointer}
-.btn-primary{background:linear-gradient(135deg,#00e5ff,#aa66ff);color:#fff}
-.btn-primary:hover{box-shadow:0 2px 12px rgba(0,229,255,.3)}
-.btn-outline{background:transparent;border:1px solid var(--br);color:var(--tx2)}
-.btn-outline:hover{border-color:var(--ac);color:var(--ac)}
-.btn-danger{background:var(--rd);color:#fff}
-.btn-sm{padding:3px 8px;font-size:8px}
-.btn-lg{padding:8px 16px;font-size:11px}
-.floating-label{position:relative;margin-bottom:6px}
-.floating-label input,.floating-label textarea,.floating-label select{width:100%;background:var(--sf);border:1px solid var(--br);padding:10px 10px 4px;border-radius:6px;color:var(--tx);font-size:9px;outline:none}
-.floating-label input:focus,.floating-label textarea:focus,.floating-label select:focus{border-color:var(--ac);box-shadow:0 0 0 2px rgba(0,229,255,.1)}
-.floating-label label{position:absolute;top:8px;left:10px;font-size:9px;color:var(--tx2);pointer-events:none;transition:all .15s}
-.floating-label input:focus~label,.floating-label input:not(:placeholder-shown)~label,.floating-label textarea:focus~label,.floating-label textarea:not(:placeholder-shown)~label{top:2px;font-size:7px;color:var(--ac)}
-.modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.8);z-index:2000;align-items:center;justify-content:center;backdrop-filter:blur(8px)}
-.modal.open{display:flex}
-.modal-content{background:var(--cd);border:1px solid var(--br);border-radius:14px;padding:16px;max-width:500px;width:92%;max-height:80vh;overflow-y:auto;animation:slide .2s}
-@keyframes slide{from{transform:translateY(10px);opacity:0}to{transform:translateY(0);opacity:1}}
-.modal-close{position:absolute;top:8px;right:8px;background:var(--cd2);border:1px solid var(--br);color:var(--tx2);width:26px;height:26px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:11px}
-.modal-close:hover{background:var(--rd);color:#fff;border-color:var(--rd)}
-.toast{position:fixed;bottom:60px;left:50%;transform:translateX(-50%);background:var(--cd);border:1px solid var(--ac);padding:8px 16px;border-radius:8px;font-size:9px;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,.5);animation:tin .2s}
-@keyframes tin{from{opacity:0;transform:translateX(-50%) translateY(10px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
-::-webkit-scrollbar{width:3px;height:3px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--br);border-radius:3px}
-@media(max-width:768px){.nav-items{display:none}.stats{grid-template-columns:repeat(2,1fr)}.g2,.g3,.g4{grid-template-columns:1fr}}
-</style></head><body>
-<div class="nav">
-  <div class="nav-logo"><span>⟡</span> NEXUS DIAMOND v5</div>
-  <div class="nav-items" id="navItems"></div>
-  <div class="nav-info"><span class="dot"></span><span id="liveInfo">0 arts</span></div>
-</div>
-<div class="content" id="content"></div>
-
-<script>
-// APP
-let state={page:'dashboard',articles:[],alertes:[],stats:{}};
-const pages=['dashboard','flux','alertes','sources','categories','settings','historique'];
-const icons={'dashboard':'📊','flux':'📡','alertes':'🚨','sources':'📰','categories':'📁','settings':'⚙️','historique':'📋'};
-
-function init(){
-  const nav=document.getElementById('navItems');
-  nav.innerHTML=pages.map(p=>`<button class="${p==='dashboard'?'active':''}" onclick="showPage('${p}')">${icons[p]} ${p.charAt(0).toUpperCase()+p.slice(1)}</button>`).join('');
-  showPage('dashboard');
-  connectSSE();
-  setInterval(loadStats,10000);
-}
-
-function showPage(p){
-  state.page=p;
-  document.querySelectorAll('.nav-items button').forEach(b=>b.classList.remove('active'));
-  document.querySelector(`.nav-items button[onclick*="'${p}'"]`)?.classList.add('active');
-  const fns={dashboard:loadDashboard,flux:loadFlux,alertes:loadAlertes,sources:loadSources,categories:loadCategories,settings:loadSettings,historique:loadHistorique};
-  if(fns[p]) fns[p]();
-}
-
-function toast(m){const t=document.createElement('div');t.className='toast';t.textContent=m;document.body.appendChild(t);setTimeout(()=>t.remove(),2000)}
-function api(p){return fetch(p).then(r=>r.json())}
-function apiPost(p,d){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d||{})}).then(r=>r.json())}
-
-async function loadStats(){
-  const s=await api('/api/stats');
-  state.stats=s;
-  document.getElementById('liveInfo').textContent=`${s.total||0} arts · ${s.alertes_non_lues||0} alertes`;
-}
-
-async function loadDashboard(){
-  const s=state.stats.total?state.stats:await api('/api/stats');
-  Object.assign(state.stats,s);
-  const al=await api('/api/alertes');
-  const art=await api('/api/articles?limit=8&sort=score');
-  document.getElementById('content').innerHTML=`
-    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:8px">
-      <div><h2 style="font-size:16px">📊 Dashboard</h2><p style="font-size:9px;color:var(--tx2)">Tout est modifiable depuis l'interface</p></div>
-      <button class="btn btn-primary btn-sm" onclick="apiPost('/api/scan');toast('📡 Scan lancé')">📡 Scanner</button>
-    </div>
-    <div class="stats">${['total','critiques','hautes','moyennes','sources','alertes_non_lues'].map(k=>`<div class="stat-card"><div class="num" style="color:${k==='critiques'?'var(--rd)':k==='alertes_non_lues'?'var(--gd)':k==='hautes'?'var(--or)':'var(--ac)'}">${s[k]||0}</div><div class="label">${k.replace('_',' ')}</div></div>`).join('')}</div>
-    <div class="grid g2">
-      <div class="card"><div class="flex" style="display:flex;justify-content:space-between;margin-bottom:6px"><b style="font-size:11px">🚨 Alertes</b><span class="badge critique">${s.alertes_non_lues||0}</span></div>
-        <div id="dashAlertes">${(al.alertes||[]).slice(0,6).map(a=>`<div class="alert-box ${a.niveau}" onclick="apiPost('/api/alerte/${a.id}/read');loadDashboard()"><b style="font-size:9px">${a.niveau==='critique'?'🔴':'🟠'} ${(a.title||'').substring(0,70)}</b><div style="font-size:7px;color:var(--tx2)">${a.scount} sources · Score: ${a.score}</div></div>`).join('')||'<div style="font-size:9px;color:var(--tx2);text-align:center;padding:10px">✅ Aucune alerte</div>'}</div></div>
-      <div class="card"><div style="display:flex;justify-content:space-between;margin-bottom:6px"><b style="font-size:11px">🔥 Top articles</b></div>
-        <div id="dashArticles">${(art.articles||[]).slice(0,8).map(a=>`<div class="item ${a.level}" onclick="window.open('${a.url||''}','_blank')"><div class="item-title">${a.level==='critique'?'🔴':a.level==='haute'?'🟠':'🟡'} ${(a.title||'').substring(0,70)}</div><div class="item-meta"><span>${a.source}</span><span>·</span><span>${a.score}pts</span><span>·</span><span>${a.region}</span></div></div>`).join('')||'<div style="font-size:9px;color:var(--tx2);text-align:center;padding:10px">Lancez un scan</div>'}</div></div>
-    </div>`;
-}
-
-async function loadFlux(){
-  const q=document.getElementById('fSearch')?.value||'';
-  const lv=document.getElementById('fLevel')?.value||'all';
-  const reg=document.getElementById('fRegion')?.value||'all';
-  const cat=document.getElementById('fCat')?.value||'all';
-  let url=`/api/articles?limit=60&sort=score&level=${lv}&region=${reg}&category=${cat}`;
-  if(q) url+=`&search=${encodeURIComponent(q)}`;
-  const data=await api(url);
-  document.getElementById('content').innerHTML=`
-    <h2 style="font-size:15px;margin-bottom:4px">📡 Flux temps réel</h2>
-    <div class="search-bar">
-      <input id="fSearch" placeholder="🔍 Mots-clés..." oninput="debounce(loadFlux,300)" value="${q}">
-      <select id="fLevel" onchange="loadFlux()"><option value="all">Tous</option><option value="critique" ${lv==='critique'?'selected':''}>🔴 Critique</option><option value="haute" ${lv==='haute'?'selected':''}>🟠 Haute</option><option value="moyenne" ${lv==='moyenne'?'selected':''}>🟡 Moyenne</option><option value="info" ${lv==='info'?'selected':''}>🗞️ Info</option></select>
-      <select id="fRegion" onchange="loadFlux()"><option value="all">🌍 Toutes</option><option value="nat" ${reg==='nat'?'selected':''}>🔵 National</option><option value="cont" ${reg==='cont'?'selected':''}>🟢 Continental</option><option value="inter" ${reg==='inter'?'selected':''}>🔴 International</option></select>
-      <select id="fCat" onchange="loadFlux()"><option value="all">📁 Toutes</option>${['Politique','Securite','Cyber','Economie','Diplomatie','Societe','Justice'].map(c=>`<option value="${c}" ${cat===c?'selected':''}>${c}</option>`).join('')}</select>
-    </div>
-    <div style="font-size:8px;color:var(--tx2);margin-bottom:4px">${data.total} résultats</div>
-    <div id="fluxList">${(data.articles||[]).map(a=>`<div class="item ${a.level}" onclick="window.open('${a.url||''}','_blank')"><div class="item-title">${a.level==='critique'?'🔴':a.level==='haute'?'🟠':a.level==='moyenne'?'🟡':'🔵'} ${(a.title||'').substring(0,100)}</div><div class="item-meta"><span>${a.source}</span><span class="badge ${a.level}" style="font-size:7px">${a.level.toUpperCase()}</span><span>${a.cat}</span><span>${a.region}</span><span>${a.score}pts</span>${a.url?`<a href="${a.url}" target="_blank" style="color:var(--ac)">🔗</a>`:''}</div></div>`).join('')||'<div style="text-align:center;padding:20px;color:var(--tx2);font-size:10px">Aucun article</div>'}</div>`;
-}
-
-async function loadAlertes(){
-  const data=await api('/api/alertes');
-  document.getElementById('content').innerHTML=`
-    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:8px">
-      <div><h2 style="font-size:15px">🚨 Alertes multi-sources</h2><p style="font-size:9px;color:var(--tx2)">Confirmées par ≥2 sources</p></div>
-      <button class="btn btn-outline btn-sm" onclick="apiPost('/api/alertes/read-all');loadAlertes()">✅ Tout marquer lu</button>
-    </div>
-    <div id="alertList">${(data.alertes||[]).map(a=>`<div class="alert-box ${a.niveau}" onclick="apiPost('/api/alerte/${a.id}/read');loadAlertes()"><div style="display:flex;justify-content:space-between"><div><b style="font-size:10px">${a.niveau==='critique'?'🔴':'🟠'} ${(a.title||'').substring(0,100)}</b><div style="font-size:8px;color:var(--tx2);margin-top:2px">📡 ${(a.sources||[]).join(', ')} · ${a.scount} sources</div></div><span style="font-size:10px;font-weight:700;color:var(--gd)">${a.score}pts</span></div><div style="font-size:8px;color:var(--tx2);margin-top:4px">${(a.descr||'').substring(0,120)}</div><div class="item-meta" style="margin-top:2px"><span>${a.cat}</span>${a.url?`<a href="${a.url}" target="_blank" style="color:var(--ac)">🔗 Source</a>`:''}</div></div>`).join('')||'<div style="text-align:center;padding:30px;color:var(--tx2);font-size:11px">✅ Aucune alerte</div>'}</div>`;
-}
-
-async function loadSources(){
-  const data=await api('/api/sources');
-  document.getElementById('content').innerHTML=`
-    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:8px">
-      <div><h2 style="font-size:15px">📰 Sources</h2><p style="font-size:9px;color:var(--tx2)">${data.sources.length} actives + ${data.custom.length} personnalisées</p></div>
-      <button class="btn btn-primary btn-sm" onclick="showAddSource()">➕ Ajouter</button>
-    </div>
-    <div style="margin-bottom:6px;font-size:10px;font-weight:600">📡 Personnalisées :</div>
-    ${data.custom.length?data.custom.map(s=>`<div class="card" style="padding:8px;margin-bottom:3px;display:flex;justify-content:space-between;align-items:center"><span><b style="font-size:10px">${s.name}</b> <span style="font-size:8px;color:var(--tx2)">${s.url.substring(0,40)}...</span></span><button class="btn btn-sm btn-danger" onclick="apiPost('/api/sources/delete/${s.name}',{}).then(loadSources)">✕</button></div>`).join(''):'<div style="font-size:9px;color:var(--tx2);padding:6px">Aucune source personnalisée</div>'}
-    <div style="margin:8px 0 6px;font-size:10px;font-weight:600">📡 Actives :</div>
-    ${data.sources.slice(0,80).map(s=>`<div class="card" style="padding:6px 8px;margin-bottom:2px"><div style="display:flex;justify-content:space-between;font-size:9px"><span><b>${s.source}</b> <span style="color:var(--tx2)">${s.region} · Niv.${s.slevel}</span></span><span>📄 ${s.ct} ${s.crit>0?`<span style="color:var(--rd)">🔴${s.crit}</span>`:''} ${s.haut>0?`<span style="color:var(--or)">🟠${s.haut}</span>`:''}</span></div></div>`).join('')}
-    <div style="text-align:center;padding:10px;font-size:9px;color:var(--tx2)">${data.sources.length>80?'... et '+(data.sources.length-80)+' autres':''}</div>`;
-}
-
-async function loadCategories(){
-  const data=await api('/api/categories');
-  document.getElementById('content').innerHTML=`
-    <h2 style="font-size:15px;margin-bottom:4px">📁 Catégories</h2>
-    <p style="font-size:9px;color:var(--tx2);margin-bottom:8px">Répartition thématique</p>
-    <div class="grid g3">${(data.categories||[]).map(c=>`<div class="card" style="text-align:center;padding:14px;cursor:pointer" onclick="document.getElementById('fCat')?document.getElementById('fCat').value='${c.cat}':null;showPage('flux')"><div style="font-size:22px;margin-bottom:4px">${c.cat==='Cyber'?'💻':c.cat==='Securite'?'🛡️':c.cat==='Politique'?'🏛️':c.cat==='Economie'?'📈':c.cat==='Diplomatie'?'🌍':c.cat==='Justice'?'⚖️':c.cat==='Societe'?'👥':'📋'}</div><div style="font-weight:600;font-size:11px">${c.cat}</div><div style="font-size:9px;color:var(--tx2)">${c.ct} articles</div>${c.crit>0?`<div style="font-size:8px;color:var(--rd)">🔴 ${c.crit} critiques</div>`:''}</div>`).join('')||'<div style="grid-column:1/-1;text-align:center;padding:20px;color:var(--tx2)">Aucune donnée</div>'}</div>`;
-}
-
-async function loadSettings(){
-  const s=state.stats.total?state.stats:await api('/api/stats');
-  document.getElementById('content').innerHTML=`
-    <h2 style="font-size:15px;margin-bottom:4px">⚙️ Paramètres</h2>
-    <p style="font-size:9px;color:var(--tx2);margin-bottom:8px">Tout est modifiable en temps réel</p>
-    <div class="grid g2">
-      <div class="card"><h3 style="font-size:11px;margin-bottom:8px">🎨 Thème</h3>
-        <div style="display:flex;gap:4px;flex-wrap:wrap">
-          ${['dark','clair','noir','bleu','vert','rouge','violet','or'].map(t=>`<button class="btn ${s.current_theme===t?'btn-primary':'btn-outline'} btn-sm" onclick="applyTheme('${t}')">${t}</button>`).join('')}
-        </div>
-      </div>
-      <div class="card"><h3 style="font-size:11px;margin-bottom:8px">⏱️ Scraping</h3>
-        <div class="floating-label"><input id="setInterval" placeholder=" " value="${s.interval||'180'}"><label>Intervalle (secondes)</label></div>
-        <div class="floating-label"><input id="setHours" placeholder=" " value="${s.hours||'24'}"><label>Profondeur (heures)</label></div>
-        <button class="btn btn-primary btn-sm mt-8" onclick="saveSettings()" style="margin-top:6px">💾 Sauvegarder</button>
-      </div>
-      <div class="card"><h3 style="font-size:11px;margin-bottom:8px">➕ Ajouter une source RSS</h3>
-        <div class="floating-label"><input id="srcName" placeholder=" "><label>Nom *</label></div>
-        <div class="floating-label"><input id="srcUrl" placeholder=" "><label>URL RSS *</label></div>
-        <div class="floating-label"><select id="srcReg" style="width:100%;background:var(--sf);border:1px solid var(--br);padding:10px 10px 4px;border-radius:6px;color:var(--tx);font-size:9px"><option value="nat">🔵 National</option><option value="cont">🟢 Continental</option><option value="inter">🔴 International</option></select></div>
-        <button class="btn btn-primary btn-sm mt-8" onclick="addSource()" style="margin-top:6px">✅ Ajouter</button>
-      </div>
-      <div class="card"><h3 style="font-size:11px;margin-bottom:8px">📊 Actions</h3>
-        <button class="btn btn-primary w-full" onclick="apiPost('/api/scan');toast('📡 Scan lancé')" style="width:100%;margin-bottom:4px">📡 Lancer un scan</button>
-        <button class="btn btn-outline w-full" onclick="apiPost('/api/alertes/read-all');toast('✅ Alertes marquées lues')" style="width:100%">✅ Tout marquer lu</button>
-      </div>
-    </div>`;
-}
-
-async function loadHistorique(){
-  const data=await api('/api/historique');
-  document.getElementById('content').innerHTML=`
-    <h2 style="font-size:15px;margin-bottom:4px">📋 Historique</h2>
-    <p style="font-size:9px;color:var(--tx2);margin-bottom:8px">Évolution des statistiques</p>
-    ${(data.historique||[]).length?data.historique.map(h=>`<div class="card" style="padding:8px;margin-bottom:3px"><div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px;font-size:9px"><span>🕐 ${h.ts}</span><span>📄 ${h.total}</span><span style="color:var(--rd)">🔴 ${h.crit}</span><span style="color:var(--or)">🟠 ${h.haut}</span><span>📡 ${h.src}</span><span style="color:var(--gd)">🚨 ${h.alrt}</span></div></div>`).join(''):'<div style="text-align:center;padding:20px;color:var(--tx2)">Aucun historique</div>'}`;
-}
-
-function debounce(fn,ms){let t;return(...args)=>{clearTimeout(t);t=setTimeout(()=>fn(...args),ms)}}
-
-async function saveSettings(){
-  const iv=document.getElementById('setInterval')?.value;
-  const hr=document.getElementById('setHours')?.value;
-  await apiPost('/api/settings',{interval:iv,hours:hr});
-  toast('✅ Paramètres sauvegardés');
-}
-
-async function addSource(){
-  const n=document.getElementById('srcName')?.value.trim();
-  const u=document.getElementById('srcUrl')?.value.trim();
-  const r=document.getElementById('srcReg')?.value||'nat';
-  if(!n||!u) return toast('❌ Nom et URL requis');
-  await apiPost('/api/sources/add',{name:n,url:u,region:r,level:70});
-  toast('✅ Source ajoutée: '+n);
-  loadSettings();
-}
-
-async function applyTheme(t){
-  await apiPost('/api/settings',{theme:t});
-  document.body.className='theme-'+t;
-  toast('🎨 Thème: '+t);
-  loadSettings();
-}
-
-function connectSSE(){
-  const src=new EventSource('/stream');
-  src.onmessage=function(e){
-    try{const ev=JSON.parse(e.data);if(ev.type==='stats'||ev.type==='scan_done'){loadDashboard();}}catch(err){}
-  };
-  src.onerror=function(){setTimeout(connectSSE,5000)};
-}
-
-// Init theme
-api('/api/stats').then(s=>{
-  if(s.current_theme){document.body.className='theme-'+s.current_theme}
-  state.stats=s;
+document.addEventListener('click',function(e){
+  const p=id('detail');if(p&&p.classList.contains('open')&&!p.contains(e.target)&&!e.target.closest('.result-card')&&!e.target.closest('.g-card'))closeD()
 });
 
-document.addEventListener('DOMContentLoaded',init);
-</script></body></html>
-"""
+document.addEventListener('keydown',function(e){
+  if(e.key==='Escape'){closeD()}
+  if(e.ctrlKey&&e.key==='s'){e.preventDefault();svNotes()}
+});
 
-# ═══════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════
-
-if __name__=="__main__":
-    print("\n"+"="*50)
-    print("  ⟡ NEXUS DIAMOND v5 — FONCTIONNEL IMMÉDIAT")
-    print("="*50)
-    print(f"  📡 {len(RSS)} sources RSS + personnalisables")
-    print(f"  🔑 {len(ALL_KW)} mots-clés")
-    print(f"  🌐 http://0.0.0.0:5000")
-    print("  ⏎ Ctrl+C pour arrêter\n")
-    
-    Scraper().start()
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
-NEXUSFINAL
+console.log('🕵️ CROGEND v10 — Prêt');
+</script>
+</body>
+</html>
